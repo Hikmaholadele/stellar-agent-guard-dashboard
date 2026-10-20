@@ -15,6 +15,14 @@
  * operator's own live re-read confirms a policy. There is no local write that
  * marks it complete (mirroring `PanicPanel`'s mandatory on-chain re-read), so a
  * stale background snapshot can never turn it green on its own.
+ *
+ * The re-reads are *read-only* and are labelled as such (issue #394): an RPC
+ * read can fail long after its write succeeded, and the recovery for that is
+ * to re-read — never to replay `initialize` or the policy submission. Each
+ * retry re-invokes exactly the failed read (`isInitialized`, or the
+ * `status()`+`policy()` pair), keeps the step pending or in error until a fresh
+ * chain result satisfies it, and is bound to the guard it started under so a
+ * late answer for a guard the operator has left is discarded.
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -41,10 +49,20 @@ export function SetupWizard() {
   const dismissed = persisted.dismissed;
   const deployedMarker = persisted.deployedMarker;
 
-  const [initializedRead, setInitializedRead] = useState<ReadResult<boolean>>({
-    ok: false,
-    error: "reading initialize state…",
-  });
+  const [initializedState, setInitializedState] = useState<{
+    guard: string;
+    value: ReadResult<boolean>;
+  }>({ guard, value: { ok: false, error: "reading initialize state…" } });
+  // Derived across a guard change rather than re-hydrated in an effect, so a
+  // late answer for the previous guard can never render as this guard's state.
+  // Memoised so the transient mismatch object cannot churn the memo below.
+  const initializedRead = useMemo<ReadResult<boolean>>(
+    () =>
+      initializedState.guard === guard
+        ? initializedState.value
+        : { ok: false, error: "reading initialize state…" },
+    [initializedState, guard],
+  );
   // `initialize` is not exposed by `status()`, so it is read from the contract's
   // own storage. Demo mode makes no RPC call, so it reports that honestly rather
   // than inventing an answer.
@@ -59,6 +77,35 @@ export function SetupWizard() {
     [demo, initializedRead],
   );
 
+  // The one read this component performs on its own, in its console shape.
+  // Shared by the mount effect and the read-only retry button, so the retry
+  // re-runs exactly the read that failed — nothing else.
+  const fetchInitialized = useCallback(
+    async (target: string): Promise<ReadResult<boolean>> => {
+      try {
+        return { ok: true, value: await isInitialized(server, target) };
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    },
+    [server],
+  );
+  const [rereadingInitialized, setRereadingInitialized] = useState(false);
+  const rereadInitialized = useCallback(async () => {
+    if (demo) return; // demo mode never touches RPC, so there is nothing to re-read
+    const target = guard;
+    setRereadingInitialized(true);
+    try {
+      const value = await fetchInitialized(target);
+      setInitializedState({ guard: target, value });
+    } finally {
+      setRereadingInitialized(false);
+    }
+  }, [demo, guard, fetchInitialized]);
+
   // Held in component state (keyed by guard), never persisted: the verify step
   // derives from a live read the operator asked for, and a reload re-asks.
   const [verification, setVerification] = useState<{
@@ -71,23 +118,13 @@ export function SetupWizard() {
   useEffect(() => {
     if (demo) return;
     let cancelled = false;
-    void (async () => {
-      try {
-        const value = await isInitialized(server, guard);
-        if (!cancelled) setInitializedRead({ ok: true, value });
-      } catch (error) {
-        if (!cancelled) {
-          setInitializedRead({
-            ok: false,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-      }
-    })();
+    void fetchInitialized(guard).then((value) => {
+      if (!cancelled) setInitializedState({ guard, value });
+    });
     return () => {
       cancelled = true;
     };
-  }, [server, guard, demo]);
+  }, [guard, demo, fetchInitialized]);
 
   const steps = useMemo(
     () =>
@@ -105,7 +142,9 @@ export function SetupWizard() {
     setVerifying(true);
     try {
       // A live re-read, not the polled snapshot: the point of the step is that
-      // the operator asked the chain right now.
+      // the operator asked the chain right now. It reads `status()` and
+      // `policy()` and nothing else — a failed verification is retried by
+      // re-reading, never by repeating the writes that got the account here.
       const [status, policy] = await Promise.all([
         readStatus(server, guard),
         readPolicy(server, guard),
@@ -176,12 +215,25 @@ export function SetupWizard() {
             <span className="row" style={{ marginTop: 4 }}>
               {step.id === "deployed" && <Link href="#deploy">Deploy a guard</Link>}
               {step.id === "initialized" && (
-                <Link href="#deploy">Initialize in the deploy panel</Link>
+                <>
+                  <Link href="#deploy">Initialize in the deploy panel</Link>
+                  {!demo && (
+                    <button
+                      className="secondary"
+                      onClick={() => void rereadInitialized()}
+                      disabled={rereadingInitialized}
+                    >
+                      {rereadingInitialized
+                        ? "Re-reading… (read-only)"
+                        : "Re-read initialize state (read-only)"}
+                    </button>
+                  )}
+                </>
               )}
               {step.id === "policy" && <Link href="#policy">Install a policy</Link>}
               {step.id === "verified" && (
                 <button className="secondary" onClick={() => void verify()} disabled={verifying}>
-                  {verifying ? "Re-reading…" : "Re-verify status & policy"}
+                  {verifying ? "Re-reading… (read-only)" : "Re-verify status & policy (read-only)"}
                 </button>
               )}
             </span>
@@ -200,7 +252,7 @@ export function SetupWizard() {
       {verified && !verified.ok && (
         <ErrorBlock
           title="The verification read failed"
-          detail={`${verified.error} — step 4 stays pending; retry rather than assuming a policy is installed.`}
+          detail={`${verified.error} — step 4 stays pending; the read-only retry below re-reads the chain (it never repeats initialize or the policy submission), and only a confirmed read turns this green.`}
         />
       )}
 

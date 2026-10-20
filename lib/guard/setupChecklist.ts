@@ -156,7 +156,7 @@ function deriveVerified(verified: ReadResult<{ hasPolicy: boolean }> | null): Se
       id: "verified",
       label: SETUP_STEPS[3]!.label,
       state: "error",
-      detail: `The live re-read failed: ${verified.error}. Still pending — retry; only a confirmed read turns this green.`,
+      detail: `The live re-read failed: ${verified.error}. Still pending — the read-only retry re-reads the chain (it never repeats a write); only a confirmed read turns this green.`,
     };
   }
   return {
