@@ -164,7 +164,14 @@ export interface GuardContextValue {
   snapshotError: string | null;
   refreshing: boolean;
   refresh: () => Promise<void>;
-  /** Per-read retry (issue #36): re-invoke ONLY one failed snapshot read. */
+  /**
+   * Per-read retry (issue #36, #386): re-invoke ONLY one failed snapshot read.
+   *
+   * Bound to the guard/network context it started in: when the active guard or
+   * the RPC server changes while the re-read is in flight, the late response
+   * belongs to a world the operator has left and is discarded — no merge, no
+   * announcement — instead of painting over the new context's view.
+   */
   retryRead: (field: SnapshotField) => Promise<void>;
   /** The snapshot field currently re-reading, if any. */
   retryingField: SnapshotField | null;
@@ -385,6 +392,17 @@ export function GuardProvider({
   // abort/ignore-stale pattern the issue's concurrency test pins; without it the
   // slower of two overlapping `refresh()` calls wins the `setSnapshot` race.
   const readEpochRef = useRef(0);
+
+  // A change of RPC server (the test seam, and any future network switch) is a
+  // context change for every in-flight read, exactly like a guard switch: the
+  // epoch moves so a read issued against the old server is discarded rather
+  // than merged. On mount there is no previous server, so nothing is bumped.
+  const lastServerRef = useRef(server);
+  useEffect(() => {
+    if (lastServerRef.current === server) return;
+    lastServerRef.current = server;
+    readEpochRef.current += 1;
+  }, [server]);
 
   // The coordinator is deliberately never closed by an effect cleanup: React's
   // development StrictMode mount/unmount/mount cycle would close the channel on
@@ -685,7 +703,7 @@ export function GuardProvider({
   }, [refresh]);
 
   /**
-   * Re-run exactly one snapshot read (issue #36).
+   * Re-run exactly one snapshot read (issue #36, #386).
    *
    * Discrete reads get discrete retries: retrying `status` must not re-invoke
    * `policy`, `window` or `identity` — the operator's per-read error report
@@ -695,10 +713,18 @@ export function GuardProvider({
    * render triple: the failed read shows its error block, then a pending
    * skeleton while the re-read is in flight, then the value or the error again
    * (with the retry still available — a failing retry is not a dead end).
+   *
+   * The retry is bound to the context it started in (#386): the read epoch is
+   * captured before the network call, and a retry that resolves after the
+   * active guard or the RPC server changed is discarded whole — its result is
+   * neither merged into the snapshot nor announced, because "policy read
+   * recovered" about a guard the operator is no longer looking at is noise at
+   * best and a lie about the current view at worst.
    */
   const retryRead = useCallback(
     async (field: SnapshotField) => {
       if (!guard || retryingField !== null) return; // one in flight at a time
+      const epoch = readEpochRef.current;
       setRetryingField(field);
       try {
         const failure = (error: unknown): { ok: false; error: string } => ({
@@ -726,6 +752,10 @@ export function GuardProvider({
               .catch(failure);
             break;
         }
+        // Discard a late response: the guard or the RPC server changed while
+        // this read was in flight, so the result belongs to a context the
+        // operator has left. Nothing is merged and nothing is announced.
+        if (epoch !== readEpochRef.current) return;
         // Merge only this field into the existing snapshot. A snapshot that has
         // been replaced wholesale (guard switch, full refresh) since the retry
         // started is left alone: the retry result is for a guard this panel may
