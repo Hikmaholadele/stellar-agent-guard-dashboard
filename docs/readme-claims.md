@@ -102,6 +102,15 @@ and are not re-verified on every sweep. The README now frames the on-chain table
 | 51  | Project structure row claims `lib/guard/` is the tested surface                | `tests/unit/*.test.ts` exercise `lib/guard/*`; see `SPEC.md` §9             | PASS                   | 2026-09-29    |
 | 52  | Topics/keyword section — did not exist (issue #51)                             | `README.md` "Topics" section                                                | **FIXED** (added)      | 2026-09-29    |
 
+## 6. Timing, retries, and input validation (issues #389, #386, #384, #394)
+
+| #   | README claim                                                                                                                                                   | Evidence                                                                                                                                                                          | Status | Last verified |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ | ------------- |
+| 53  | A dead-man countdown from a read more than a minute old is labelled stale rather than presented as current                                                     | [`lib/guard/dmsAlert.ts`](../lib/guard/dmsAlert.ts) (`countdownStale`), [`components/StatusPanel.tsx`](../components/StatusPanel.tsx), `tests/unit/dmsStaleRead.test.ts`          | PASS   | 2026-10-20    |
+| 54  | Each failed read carries its own retry that re-reads only that field, bound to the current guard/network, with late responses after a context change discarded | [`components/GuardProvider.tsx`](../components/GuardProvider.tsx) (`retryRead`), `tests/unit/panelRetry.test.ts`, `tests/unit/retryableRead.test.ts`                              | PASS   | 2026-10-20    |
+| 55  | Checklist read failures retry read-only, never replaying `initialize` or the policy submission                                                                 | [`components/SetupWizard.tsx`](../components/SetupWizard.tsx), `tests/unit/setupWizard.test.ts`                                                                                   | PASS   | 2026-10-20    |
+| 56  | Address-book nicknames and imported names reject invisible/control characters with a field-level error, preserving international text                          | [`lib/guard/inputSanitizer.ts`](../lib/guard/inputSanitizer.ts) (`validateLabel`), [`lib/guard/addressBook.ts`](../lib/guard/addressBook.ts), `tests/unit/inputSanitizer.test.ts` | PASS   | 2026-10-20    |
+
 ## Named-entity existence proof
 
 Every component, route, and script name the README mentions must exist at the path it says. This is
