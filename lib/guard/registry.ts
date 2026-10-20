@@ -11,6 +11,10 @@
  *   2. Read the contract's own `status()` — the same read the panels use — and
  *      refuse the add when it traps or the transport fails.
  *
+ * An operator-supplied label is additionally screened against the label policy
+ * (`inputSanitizer.ts`) before either step, so a deceptive name is refused
+ * without touching the network at all.
+ *
  * It signs nothing: the add flow never touches a wallet, so there is no
  * `sendTransaction` on this path at all. That is asserted by call-count in
  * `registryLive.test.ts`, not merely intended.
@@ -21,6 +25,7 @@
 
 import { StrKey, type rpc } from "@stellar/stellar-sdk";
 import { readStatus } from "./chain.ts";
+import { validateLabel } from "./inputSanitizer.ts";
 import {
   defaultGuardLabel,
   looksLikeContractAddress,
@@ -101,6 +106,13 @@ export type AddGuardResult =
  */
 export async function addGuard(params: AddGuardParams): Promise<AddGuardResult> {
   const address = params.address.trim();
+  // The label is screened before any RPC call: a name carrying invisible or
+  // control characters (issue #384) is refused with the same field-level
+  // message the address book shows, and nothing is read or remembered.
+  if (params.label !== undefined) {
+    const labelCheck = validateLabel(params.label);
+    if (!labelCheck.ok) return { ok: false, kind: "invalid", error: labelCheck.error };
+  }
   const label = (params.label ?? "").trim() || defaultGuardLabel(address);
   const check = await verifyGuardIsLive(params.server, address);
   if (!check.ok) {

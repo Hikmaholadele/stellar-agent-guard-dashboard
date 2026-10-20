@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { before, describe, it } from "node:test";
+import type { rpc } from "@stellar/stellar-sdk";
 import { installDom, loadReact, sleep, type Act } from "./domHarness.ts";
 import {
   SECRET_KEY_PATTERN,
   SECRET_KEY_WARNING,
   dismissSecretKeyAlert,
+  findDisallowedLabelChar,
   findSecretKeyInText,
   getSecretKeyAlert,
   installSecretKeyGuard,
@@ -12,7 +14,15 @@ import {
   raiseSecretKeyAlert,
   sanitizeAddressInput,
   subscribeSecretKeyAlerts,
+  validateLabel,
 } from "../../lib/guard/inputSanitizer.ts";
+import {
+  loadAddressBook,
+  previewAddressBookImport,
+  saveContact,
+  type StorageLike,
+} from "../../lib/guard/addressBook.ts";
+import { addGuard } from "../../lib/guard/registry.ts";
 
 installDom();
 
@@ -464,5 +474,214 @@ describe("document-level paste/input/change interception", () => {
       container.remove();
       reset();
     }
+  });
+});
+
+// ── Label policy (issue #384) ───────────────────────────────────────────────
+//
+// The policy: whitespace is normalized, invisible and control characters are
+// rejected with a field-level error, and valid international text is never
+// rewritten. The tests run it against the primitives and against the two
+// entry points that persist labels — a typed save and an imported file.
+
+describe("label policy: detection", () => {
+  it("accepts ordinary and international text untouched", () => {
+    const clean = [
+      "Treasury Multisig",
+      "Équipe Trésorière — Café Münster",
+      "日本語のラベル",
+      "Привет, мир",
+      "حساب المستخدم",
+      "🚀 Launch account",
+      "Straße (Übung)",
+      "",
+    ];
+    for (const label of clean) {
+      assert.equal(findDisallowedLabelChar(label), null, `${label} must be clean`);
+      assert.equal(validateLabel(label).ok, true, `${label} must be accepted`);
+    }
+  });
+
+  it("accepts whitespace, because whitespace is normalized rather than rejected", () => {
+    // Tabs, newlines, non-breaking spaces and the Unicode separators the
+    // whitespace class owns are collapsed by `normalizeAlias`, not refused.
+    for (const label of ["  Treasury  ", "Vault\tPromo", "Vault\nPromo", "Vault\u00A0Promo"]) {
+      assert.equal(findDisallowedLabelChar(label), null, `${JSON.stringify(label)} is whitespace`);
+      assert.equal(validateLabel(label).ok, true);
+    }
+  });
+
+  it("rejects every invisible and control class, naming the code point", () => {
+    const cases: Array<[string, string, string]> = [
+      ["Vault\u200BPromo", "U+200B", "ZERO WIDTH SPACE"],
+      ["Vault\u200CPromo", "U+200C", "ZERO WIDTH NON-JOINER"],
+      ["Vault\u200DPromo", "U+200D", "ZERO WIDTH JOINER"],
+      // The deceptive pair itself: with the ZWSP removed the two labels render
+      // identically, which is exactly what the policy refuses to allow.
+      ["Vault\u200B Promo", "U+200B", "ZERO WIDTH SPACE"],
+      ["invoice\u202Efdp.exe", "U+202E", "RIGHT-TO-LEFT OVERRIDE"],
+      ["invoice\u202Dfdp.exe", "U+202D", "LEFT-TO-RIGHT OVERRIDE"],
+      ["Treasur\uFEFFy", "U+FEFF", "BOM"],
+      ["Treasur\u00ADy", "U+00AD", "SOFT HYPHEN"],
+      ["Treasury\u2060x", "U+2060", "WORD JOINER"],
+      ["Treasury\u2069x", "U+2069", "POP DIRECTIONAL ISOLATE"],
+      ["Treasury\u0000x", "U+0000", "CONTROL CHARACTER"],
+      ["Treasury\u007Fx", "U+007F", "CONTROL CHARACTER"],
+      ["Treasury\u0085x", "U+0085", "CONTROL CHARACTER"],
+      ["Treasury\u2028x", "U+2028", "LINE SEPARATOR"],
+    ];
+    for (const [label, code, name] of cases) {
+      const found = findDisallowedLabelChar(label);
+      assert.ok(found, `${JSON.stringify(label)} must be rejected`);
+      assert.equal(found.code, code, `${JSON.stringify(label)} → ${found.code}`);
+      assert.match(found.name, new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+
+      const check = validateLabel(label);
+      assert.equal(check.ok, false, `${JSON.stringify(label)} must fail validation`);
+      if (!check.ok) {
+        assert.ok(check.error.includes(code), `the error must name ${code}`);
+        assert.ok(check.error.includes(found.name), "the error must name the character class");
+      }
+    }
+  });
+
+  it("reports the first offender's position so the field can point at it", () => {
+    const found = findDisallowedLabelChar("Clean\u200B label");
+    assert.ok(found);
+    assert.equal(found.index, 5);
+    const check = validateLabel("Clean\u200B label");
+    assert.equal(check.ok, false);
+    if (!check.ok) assert.match(check.error, /position 6/);
+  });
+});
+
+describe("label policy: typed saves (address book)", () => {
+  const ACCOUNT = "GDQAPKMAI3WA6H4TDLAWUM6BCQOB22SCQIQWQMLWAHTDRWOVYCXRCVTK";
+  const OTHER = "GA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVSGZ";
+
+  function memoryStorage(): StorageLike {
+    const map = new Map<string, string>();
+    return {
+      getItem: (key) => map.get(key) ?? null,
+      setItem: (key, value) => void map.set(key, value),
+    };
+  }
+
+  it("refuses a typed label with an invisible character, and persists nothing", () => {
+    const storage = memoryStorage();
+    assert.throws(
+      () => saveContact({ address: ACCOUNT, label: "Vault\u200BPromo" }, storage),
+      /U\+200B/,
+      "the refusal must name the offending character",
+    );
+    assert.deepEqual(loadAddressBook(storage), [], "nothing was written");
+  });
+
+  it("the two visually identical labels cannot both exist: one is saved, one is refused", () => {
+    const storage = memoryStorage();
+    saveContact({ address: ACCOUNT, label: "Vault Promo" }, storage);
+    // Without the policy this would collide invisibly or slip past the
+    // operator's eye; with it, the save is refused outright.
+    assert.throws(
+      () => saveContact({ address: OTHER, label: "Vault\u200B Promo" }, storage),
+      /U\+200B/,
+    );
+    const book = loadAddressBook(storage);
+    assert.equal(book.length, 1);
+    assert.equal(book[0]!.label, "Vault Promo");
+  });
+
+  it("preserves ordinary accented text exactly as typed (after whitespace normalization)", () => {
+    const storage = memoryStorage();
+    const result = saveContact({ address: ACCOUNT, label: "  Équipe  Trésorière " }, storage);
+    assert.equal(result.status, "saved");
+    if (result.status === "saved") assert.equal(result.contact.label, "Équipe Trésorière");
+  });
+
+  it("drops a pre-policy deceptive entry when the stored book is loaded", () => {
+    const storage = memoryStorage();
+    storage.setItem(
+      "stellar-agent-guard-dashboard.addressBook.v1",
+      JSON.stringify([
+        { address: ACCOUNT, label: "Vault\u200BPromo", addedAt: "2026-01-01T00:00:00.000Z" },
+        { address: OTHER, label: "Clean", addedAt: "2026-01-01T00:00:00.000Z" },
+      ]),
+    );
+    const book = loadAddressBook(storage);
+    assert.deepEqual(
+      book.map((contact) => contact.label),
+      ["Clean"],
+      "the deceptive entry is dropped; loading is a save path too",
+    );
+  });
+});
+
+describe("label policy: imported names", () => {
+  const ACCOUNT = "GDQAPKMAI3WA6H4TDLAWUM6BCQOB22SCQIQWQMLWAHTDRWOVYCXRCVTK";
+  const OTHER = "GA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVSGZ";
+
+  function file(records: unknown[]): string {
+    return JSON.stringify({
+      schema: "stellar-agent-guard/address-book",
+      version: 1,
+      exportedAt: "2026-10-20T00:00:00.000Z",
+      contacts: records,
+    });
+  }
+
+  it("reports an imported label with a bidi override as invalid, record by record", () => {
+    const preview = previewAddressBookImport(
+      file([
+        { address: ACCOUNT, label: "Treasury" },
+        { address: OTHER, label: "invoice\u202Efdp.exe" },
+      ]),
+      [],
+    );
+    assert.equal(preview.mergeable.length, 1, "the clean record is still importable");
+    assert.equal(preview.invalid.length, 1);
+    const issue = preview.invalid[0]!;
+    assert.equal(issue.index, 2, "the offending record is pointed at");
+    assert.match(issue.reason, /Contact 2/);
+    assert.match(issue.reason, /U\+202E/, "the reason names the code point");
+    assert.equal(preview.result.merge.length, 1, "the deceptive label never lands");
+  });
+
+  it("imports ordinary accented and non-Latin labels unchanged", () => {
+    const preview = previewAddressBookImport(
+      file([
+        { address: ACCOUNT, label: "Équipe Trésorière" },
+        { address: OTHER, label: "日本語のラベル" },
+      ]),
+      [],
+    );
+    assert.equal(preview.invalid.length, 0);
+    assert.deepEqual(
+      preview.mergeable.map((contact) => contact.label),
+      ["Équipe Trésorière", "日本語のラベル"],
+    );
+  });
+});
+
+describe("label policy: guard registry names", () => {
+  const GUARD = "CBLQLJAG72M4XQRJMQHSKYIFVHQD7LNTNOQH2GRMCMBWMSLBSLTGTJC7";
+
+  it("refuses a deceptive registry label before any RPC call", async () => {
+    let touched = 0;
+    const server = new Proxy(
+      {},
+      {
+        get: () => {
+          touched += 1;
+          throw new Error("the network must not be touched for a label rejection");
+        },
+      },
+    ) as unknown as rpc.Server;
+    const result = await addGuard({ server, address: GUARD, label: "Treasury\u200B" });
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.kind, "invalid");
+      assert.match(result.error, /U\+200B/);
+    }
+    assert.equal(touched, 0, "no property of the server was ever read");
   });
 });

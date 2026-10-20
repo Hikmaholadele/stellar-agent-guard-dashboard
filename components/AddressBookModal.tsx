@@ -38,6 +38,7 @@ import {
   type ImportMode,
   type ImportPreview,
 } from "../lib/guard/addressBook.ts";
+import { validateLabel } from "../lib/guard/inputSanitizer.ts";
 
 const ISSUE_LABELS = {
   invalid: "Invalid",
@@ -191,6 +192,11 @@ export function AddressBookModal({ onClose }: { onClose: () => void }) {
   }
 
   const addressInBook = contacts.some((contact) => contact.address === editingAddress.trim());
+  // The label policy (issue #384) is also enforced here as a field-level error,
+  // live as the operator types: invisible and control characters are named at
+  // the field instead of only after the save is refused.
+  const labelCheck = validateLabel(editingLabel);
+  const labelError = labelCheck.ok ? null : labelCheck.error;
   const previewHasIssues =
     preview !== null &&
     preview.invalid.length + preview.duplicates.length + preview.aliasConflicts.length > 0;
@@ -238,7 +244,19 @@ export function AddressBookModal({ onClose }: { onClose: () => void }) {
             }}
             placeholder="Treasury Multisig"
             aria-label="Contact nickname"
+            aria-invalid={labelError === null ? undefined : true}
+            aria-describedby={labelError === null ? undefined : "contact-label-error"}
           />
+          {labelError !== null && (
+            <span
+              id="contact-label-error"
+              className="hint"
+              role="alert"
+              style={{ color: "var(--danger)" }}
+            >
+              {labelError}
+            </span>
+          )}
         </label>
         {error && (
           <div className="error" role="alert">

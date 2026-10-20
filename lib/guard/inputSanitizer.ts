@@ -22,6 +22,12 @@
  * alert rendered by `<SecretKeyGuard />`. The store is deliberately
  * framework-free so its semantics are unit-testable under node:test — the
  * same split as `useToast` and `useAnnounce`.
+ *
+ * The file also hosts the *label policy* for operator-authored text (issue
+ * #384) — the second place where what a field displays must equal what it
+ * contains. Both sections share one principle: a value that can display as
+ * something other than what it says is refused, with a reason the operator
+ * can act on.
  */
 
 /** The Stellar secret seed shape: `S` followed by 55 uppercase base32 characters. */
@@ -58,6 +64,122 @@ export function findSecretKeyInText(text: string): string | null {
  */
 export function sanitizeAddressInput(value: string): string {
   return findSecretKeyInText(value) === null ? value : "";
+}
+
+// ── Human-readable label policy (issue #384) ───────────────────────────────
+//
+// Address-book nicknames and guard-registry names are what the operator reads
+// when choosing an account, so a label must display exactly what it says — in
+// the console, in exports, and in a terminal. Two invisible-character attacks
+// make that false, and both are refused here rather than normalized away:
+//
+//   - **Zero-width characters** (ZWSP, ZWNJ, ZWJ, word joiner, BOM, soft
+//     hyphen) let two *different* labels render identically ("Vault\u200B"
+//     and "Vault"), so an operator cannot tell which entry they picked.
+//   - **Bidi controls** (embeddings, overrides, isolates, marks) can reorder
+//     the rendered text, so a label can display as something other than the
+//     string that was saved.
+//
+// The documented normalization policy, applied in this order by the callers:
+//
+//   1. Whitespace is *normalized*, never rejected: leading/trailing whitespace
+//      is dropped and internal runs collapse to one space (`normalizeAlias` in
+//      `addressBook.ts` owns that step; tabs and newlines are whitespace).
+//   2. Anything invisible that is not whitespace is *rejected* by
+//      `validateLabel` with a field-level error naming the offending code
+//      point. Stripping them instead would be destructive — the saved label
+//      would differ from what the operator submitted — and accepting them
+//      would allow a deceptive label through, so the save is refused and the
+//      operator fixes the field.
+//   3. Everything else is preserved untouched: accented Latin, non-Latin
+//      scripts (Cyrillic, CJK, Arabic, Hebrew), emoji and punctuation are
+//      valid label text and are never rewritten.
+
+/**
+ * Every character class the label policy rejects: C0 controls outside the
+ * whitespace set, DEL + C1 controls, soft hyphen, zero-width and directional
+ * marks, bidi embeddings/overrides/isolates, the word joiner, the BOM, and the
+ * Unicode line/paragraph separators. Whitespace (space, tab, newline, NBSP, …)
+ * is deliberately absent — it is normalized, not rejected.
+ */
+export const DISALLOWED_LABEL_CHARS =
+  /[\u0000-\u0008\u000E-\u001F\u007F-\u009F\u00AD\u180E\u200B-\u200F\u2028\u2029\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]/u;
+
+/** Readable names for the disallowed characters operators actually meet. */
+const LABEL_CHAR_NAMES: Record<string, string> = {
+  "\u00AD": "SOFT HYPHEN",
+  "\u180E": "MONGOLIAN VOWEL SEPARATOR",
+  "\u200B": "ZERO WIDTH SPACE",
+  "\u200C": "ZERO WIDTH NON-JOINER",
+  "\u200D": "ZERO WIDTH JOINER",
+  "\u200E": "LEFT-TO-RIGHT MARK",
+  "\u200F": "RIGHT-TO-LEFT MARK",
+  "\u2028": "LINE SEPARATOR",
+  "\u2029": "PARAGRAPH SEPARATOR",
+  "\u202A": "LEFT-TO-RIGHT EMBEDDING",
+  "\u202B": "RIGHT-TO-LEFT EMBEDDING",
+  "\u202C": "POP DIRECTIONAL FORMATTING",
+  "\u202D": "LEFT-TO-RIGHT OVERRIDE",
+  "\u202E": "RIGHT-TO-LEFT OVERRIDE",
+  "\u2060": "WORD JOINER",
+  "\u2066": "LEFT-TO-RIGHT ISOLATE",
+  "\u2067": "RIGHT-TO-LEFT ISOLATE",
+  "\u2068": "FIRST STRONG ISOLATE",
+  "\u2069": "POP DIRECTIONAL ISOLATE",
+  "\uFEFF": "ZERO WIDTH NO-BREAK SPACE (BOM)",
+};
+
+/** The first character of a label the policy refuses, where it is, and why. */
+export interface DisallowedLabelChar {
+  char: string;
+  /** The code point, formatted `U+XXXX`. */
+  code: string;
+  name: string;
+  /** Zero-based index of the offending character in the original string. */
+  index: number;
+}
+
+/**
+ * Find the first disallowed character in a label, or null when the label is
+ * clean. Runs on the *raw* value, before whitespace normalization, so nothing
+ * can hide behind a character the normalizer would rewrite.
+ */
+export function findDisallowedLabelChar(value: string): DisallowedLabelChar | null {
+  const match = new RegExp(DISALLOWED_LABEL_CHARS.source, "u").exec(value);
+  if (!match) return null;
+  const char = match[0]!;
+  const point = char.codePointAt(0)!; // a matched character always has one
+  const code = `U+${point.toString(16).toUpperCase().padStart(4, "0")}`;
+  const named = LABEL_CHAR_NAMES[char];
+  return {
+    char,
+    code,
+    name: named ?? (point <= 0x9f ? "CONTROL CHARACTER" : "INVISIBLE FORMAT CHARACTER"),
+    index: match.index,
+  };
+}
+
+/** The result of screening a label: accepted as-is, or a field-level error. */
+export type LabelCheck = { ok: true } | { ok: false; error: string };
+
+/**
+ * The label policy as callers use it: reject a label containing any invisible
+ * or control character, with an operator-facing message that names the exact
+ * code point so the fix is mechanical. A label the policy accepts is returned
+ * ok without modification — normalization is the callers' next step, and a
+ * preserved international label is never rewritten.
+ */
+export function validateLabel(raw: string): LabelCheck {
+  const found = findDisallowedLabelChar(raw);
+  if (found === null) return { ok: true };
+  return {
+    ok: false,
+    error:
+      `The label contains ${found.code} (${found.name}) at position ${found.index + 1}. ` +
+      "Invisible and control characters are not allowed in labels — they can make two labels " +
+      "look identical or display as different text than what was saved. Remove the highlighted " +
+      "characters and try again.",
+  };
 }
 
 // ── Security alert store ─────────────────────────────────────────────────────
