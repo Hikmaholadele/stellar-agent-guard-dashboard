@@ -11,9 +11,11 @@
  * Every calculation here reads the **ledger clock** (`status.now`), never
  * `Date.now()`. The switch is judged by ledger time on chain, so an operator's
  * skewed local clock must not be able to green-wash a late heartbeat or
- * cry-wolf an early one. The calendar estimate is the one wall-clock
- * translation, and it is labelled an estimate because ledger close time tracks
- * wall clock only approximately.
+ * cry-wolf an early one. The calendar estimate is one wall-clock translation,
+ * and it is labelled an estimate because ledger close time tracks wall clock
+ * only approximately; the freshness check (`countdownStale`) is the other —
+ * it compares the read's own timestamp against the local clock to say how old
+ * the read is, an age rather than a deadline.
  *
  * Thresholds (from the alerting spec):
  * - `warning` (yellow) when less than 25% of the grace remains, or less than
@@ -103,7 +105,7 @@ export function evaluateDmsAlert(
 
   // Elapsed time needs only the ledger's own two timestamps, so it survives a
   // failed policy read; the deadline fields below additionally need the grace.
-  const elapsedSecs = clockRunning ? Number(status.now - heartbeatSecs) : null;
+  const elapsedSecs = heartbeatSecs !== 0n ? Number(status.now - heartbeatSecs) : null;
 
   let remainingSecs: number | null = null;
   let fractionRemaining: number | null = null;
@@ -137,6 +139,37 @@ export function evaluateDmsAlert(
     elapsedSecs,
     expiresAtMs,
   };
+}
+
+// ── Read freshness (issue #389) ───────────────────────────────────────────
+
+/**
+ * How old the ledger read behind a countdown may be before the UI presents
+ * that countdown as *uncertain* rather than current.
+ *
+ * Four times the 15-second snapshot poll: one missed poll is normal jitter,
+ * four is a stalled read — a throttled background tab, an RPC that stopped
+ * answering after its last success — and a countdown drawn from it describes
+ * the past, not the switch the contract will judge. The threshold marks the
+ * point where the banner must say so instead of letting a stale figure read
+ * as a live one.
+ */
+export const DMS_STALE_READ_MS = 60_000;
+
+/**
+ * Is the ledger read this countdown derives from too old to present as
+ * current?
+ *
+ * `fetchedAtMs` is the read's own timestamp (the snapshot's `fetchedAt`);
+ * `nowMs` is the local clock. The local clock is used only for the *age* of
+ * the read — never for the deadline, which stays ledger-derived. Clock skew
+ * is therefore bounded in the safe direction: a local clock that jumped
+ * backwards makes the read look *fresher*, never staler, and an unparseable
+ * timestamp is uncertainty (stale), not a free pass.
+ */
+export function countdownStale(fetchedAtMs: number, nowMs: number): boolean {
+  if (!Number.isFinite(fetchedAtMs)) return true;
+  return nowMs - fetchedAtMs >= DMS_STALE_READ_MS;
 }
 
 /**

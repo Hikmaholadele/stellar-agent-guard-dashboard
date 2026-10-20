@@ -33,7 +33,12 @@ import {
   type SimulationScenario,
   type SimulationState,
 } from "../lib/guard/dmsSimulator.ts";
-import { evaluateDmsAlert, formatDmsDuration, type DmsAlert } from "../lib/guard/dmsAlert.ts";
+import {
+  countdownStale,
+  evaluateDmsAlert,
+  formatDmsDuration,
+  type DmsAlert,
+} from "../lib/guard/dmsAlert.ts";
 import { calculateVelocity } from "../lib/guard/velocity.ts";
 import { useStatusTransitionAnnouncer } from "../lib/guard/statusTransitions.ts";
 
@@ -46,8 +51,13 @@ import { useStatusTransitionAnnouncer } from "../lib/guard/statusTransitions.ts"
  * remaining time, time since the last heartbeat, and the estimated calendar
  * moment of expiration. Every number comes from the snapshot's ledger clock,
  * never the browser's, because that is the clock the contract judges.
+ *
+ * When the read behind the countdown has gone stale (#389), the banner says so
+ * instead of letting the figures read as current: the numbers stay exactly
+ * what the chain last reported — an old deadline is shown as old, never
+ * re-derived from the local clock into a fresh-looking one.
  */
-function DmsAlertBanner({ alert }: { alert: DmsAlert }) {
+function DmsAlertBanner({ alert, stale }: { alert: DmsAlert; stale: boolean }) {
   const details: string[] = [];
   if (alert.remainingSecs !== null && alert.totalSecs !== null) {
     const pct = Math.max(0, Math.round(alert.fractionRemaining! * 100));
@@ -76,8 +86,31 @@ function DmsAlertBanner({ alert }: { alert: DmsAlert }) {
     <div className={`dms-banner no-print ${alert.level}`} role="alert">
       <strong>{title}</strong>
       {details.length > 0 && <span className="detail">{details.join(" · ")}</span>}
+      {stale && (
+        <span className="detail" data-testid="dms-stale-note">
+          stale read — these figures are from the last successful ledger read, not a new one; they
+          are not a fresh deadline. Refresh to re-read the chain.
+        </span>
+      )}
     </div>
   );
+}
+
+/**
+ * A ticking local clock, in epoch milliseconds, for read-*age* displays only.
+ *
+ * The same pattern as `TimeAgo`: the render stays pure (state, not a clock
+ * read), and the interval only re-renders the components that asked. Nothing
+ * derived from this value may ever feed a countdown decision — the ledger
+ * clock owns those.
+ */
+function useNowMs(intervalMs = 5_000): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), intervalMs);
+    return () => clearInterval(id);
+  }, [intervalMs]);
+  return now;
 }
 
 /**
@@ -121,6 +154,12 @@ export function StatusPanel() {
       ? evaluateDmsAlert(snapshot.status.value, snapshot.policy.ok ? snapshot.policy.value : null)
       : null;
 
+  // Read freshness for the banner (#389): the local clock measures only how old
+  // the snapshot is — the countdown itself stays ledger-derived — so a stale
+  // read is labelled uncertain instead of presenting a past deadline as current.
+  const nowMs = useNowMs();
+  const dmsAlertStale = snapshot !== null && countdownStale(Date.parse(snapshot.fetchedAt), nowMs);
+
   // The panel is `aria-busy` exactly while the first read is in flight (no
   // snapshot yet, no failure yet). A background refresh is NOT busy: the values
   // on screen are the previous successful read (stale-while-revalidate), so
@@ -133,7 +172,9 @@ export function StatusPanel() {
 
   return (
     <>
-      {dmsAlert && dmsAlert.level !== "none" && <DmsAlertBanner alert={dmsAlert} />}
+      {dmsAlert && dmsAlert.level !== "none" && (
+        <DmsAlertBanner alert={dmsAlert} stale={dmsAlertStale} />
+      )}
       <div
         className={`panel${rehearsalActive ? " sim-active" : ""}`}
         aria-busy={initialLoadPending}
