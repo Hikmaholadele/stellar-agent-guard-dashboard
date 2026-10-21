@@ -133,7 +133,7 @@ test("a freeze nobody performed is announced", () => {
   // did not do this and knows nothing about it but the flag.
   assert.deepEqual(h.announcer.observe(snapshot({ adminFrozen: true })), ["frozen"]);
   assert.deepEqual(h.spoken, [
-    { message: "On-chain state: the account is frozen", priority: "polite" },
+    { message: `On-chain state: the account is frozen for guard ${GUARD_A}`, priority: "polite" },
   ]);
 });
 
@@ -163,7 +163,7 @@ test("a reversal is announced even inside the corroboration window", () => {
   h.travel(1_000);
   assert.deepEqual(h.announcer.observe(snapshot({ adminFrozen: false })), ["unfrozen"]);
   assert.deepEqual(h.spoken.at(-1), {
-    message: "On-chain state: the account is no longer frozen",
+    message: `On-chain state: the account is no longer frozen for guard ${GUARD_A}`,
     priority: "polite",
   });
 });
@@ -251,6 +251,13 @@ test("every flip in a single poll is announced, most urgent first", () => {
     h.spoken.map((item) => item.priority),
     ["polite", "assertive", "assertive"],
   );
+});
+
+test("a transition announcement names the guard whose chain state changed", () => {
+  const h = harness();
+  h.announcer.observe(snapshot({ adminFrozen: false }, GUARD_B));
+  h.announcer.observe(snapshot({ adminFrozen: true }, GUARD_B));
+  assert.match(h.spoken[0]?.message ?? "", new RegExp(GUARD_B));
 });
 
 test("each transition has copy, and every message names the state it is about", () => {

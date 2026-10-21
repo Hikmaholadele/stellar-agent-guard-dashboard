@@ -62,8 +62,8 @@ type PolicyOutcome =
   { kind: "invalid"; issues: string[] } | { kind: "invoked"; result: InvokeResult };
 
 /** Speak a policy write's outcome, with the reason when it did not land. */
-function speakPolicy(operation: PolicyOperation, reason: string): void {
-  const spoken = policyFailed(operation, reason);
+function speakPolicy(operation: PolicyOperation, reason: string, guard?: string): void {
+  const spoken = policyFailed(operation, reason, guard);
   announce(spoken.message, spoken.priority);
 }
 
@@ -81,16 +81,18 @@ function speakPolicyOutcome(
   operation: PolicyOperation,
   outcome: PolicyOutcome,
   exportOnly: boolean,
+  guard?: string,
 ): void {
   if (outcome.kind === "invalid") {
     speakPolicy(
       operation,
       `the policy was not valid, so nothing was sent: ${outcome.issues.join("; ")}`,
+      guard,
     );
     return;
   }
   if (outcome.result.kind === "submitted") {
-    const spoken = policyConfirmed(operation);
+    const spoken = policyConfirmed(operation, guard);
     announce(spoken.message, spoken.priority);
     // The write landed, so the next poll should not repeat it. Recorded here
     // because this is the only place that knows what the operator just did;
@@ -106,6 +108,7 @@ function speakPolicyOutcome(
         ? "the transaction was only exported, so nothing was submitted"
         : "the write did not complete",
     ),
+    guard,
   );
 }
 
@@ -355,14 +358,14 @@ export function PolicyForm() {
       if (result.kind === "invoked" && result.result.kind === "submitted") {
         notifyTabs("POLICY_UPDATED", { payload: { operation: "set_policy" } });
       }
-      speakPolicyOutcome("set_policy", result, exportOnly);
+      speakPolicyOutcome("set_policy", result, exportOnly, guard ?? undefined);
       if (!exportOnly) {
         await refresh();
       }
     } catch (caught) {
       const detail = caught instanceof Error ? caught.message : String(caught);
       setError(detail);
-      speakPolicy("set_policy", detail);
+      speakPolicy("set_policy", detail, guard ?? undefined);
     } finally {
       setBusy(false);
     }
@@ -378,14 +381,19 @@ export function PolicyForm() {
       if (result.kind === "submitted") {
         notifyTabs("POLICY_UPDATED", { payload: { operation: "revoke_policy" } });
       }
-      speakPolicyOutcome("revoke_policy", { kind: "invoked", result }, exportOnly);
+      speakPolicyOutcome(
+        "revoke_policy",
+        { kind: "invoked", result },
+        exportOnly,
+        guard ?? undefined,
+      );
       if (!exportOnly) {
         await refresh();
       }
     } catch (caught) {
       const detail = caught instanceof Error ? caught.message : String(caught);
       setError(detail);
-      speakPolicy("revoke_policy", detail);
+      speakPolicy("revoke_policy", detail, guard ?? undefined);
     } finally {
       setBusy(false);
     }

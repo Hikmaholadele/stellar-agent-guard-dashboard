@@ -201,7 +201,14 @@ export async function submitOperation(params: {
     if (!result) continue;
     if (result.status === rpc.Api.GetTransactionStatus.SUCCESS) {
       const ledger = (result as { ledger?: number }).ledger ?? null;
-      recordTx({ hash: sent.hash, operation: label, status: "confirmed", feeStroops });
+      recordTx({
+        hash: sent.hash,
+        operation: label,
+        status: "confirmed",
+        feeStroops,
+        networkName: NETWORK.name,
+        networkPassphrase: passphrase,
+      });
       announce(
         ledger !== null
           ? `Transaction confirmed on ledger ${ledger}`
@@ -217,7 +224,14 @@ export async function submitOperation(params: {
       };
     }
     if (result.status === rpc.Api.GetTransactionStatus.FAILED) {
-      recordTx({ hash: sent.hash, operation: label, status: "failed", feeStroops });
+      recordTx({
+        hash: sent.hash,
+        operation: label,
+        status: "failed",
+        feeStroops,
+        networkName: NETWORK.name,
+        networkPassphrase: passphrase,
+      });
       announce("Transaction failed on chain");
       return {
         kind: "failed",
@@ -230,7 +244,14 @@ export async function submitOperation(params: {
       };
     }
   }
-  recordTx({ hash: sent.hash, operation: label, status: "failed", feeStroops });
+  recordTx({
+    hash: sent.hash,
+    operation: label,
+    status: "failed",
+    feeStroops,
+    networkName: NETWORK.name,
+    networkPassphrase: passphrase,
+  });
   announce("Transaction failed on chain");
   return {
     kind: "failed",

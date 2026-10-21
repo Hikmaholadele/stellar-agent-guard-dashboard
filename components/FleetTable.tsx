@@ -94,12 +94,12 @@ export function FleetTable() {
       // freeze is spoken exactly once no matter which page ran it.
       const spoken =
         result.kind === "submitted"
-          ? freezeSubmitted()
-          : freezeFailed("freeze", writeFailureReason(result, "the write did not complete"));
+          ? freezeSubmitted(guard)
+          : freezeFailed("freeze", writeFailureReason(result, "the write did not complete"), guard);
       announce(spoken.message, spoken.priority);
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
-      const spoken = freezeFailed("freeze", detail);
+      const spoken = freezeFailed("freeze", detail, guard);
       announce(spoken.message, spoken.priority);
       console.error(err);
     }

@@ -16,17 +16,30 @@ import {
   loadTxHistory,
   paginateTxHistory,
   subscribeTxHistory,
+  txHistoryMatchesNetwork,
   txHistoryToCsv,
+  txVerificationStatus,
+  type TxVerificationStatus,
   type TxHistoryEntry,
 } from "../lib/guard/txHistory.ts";
+import { NETWORK } from "../lib/guard/network.ts";
 import { useAnnounce } from "../lib/guard/useAnnounce.ts";
+import { useGuard } from "./GuardProvider.tsx";
 import { starLink, TxHashCell } from "./bits.tsx";
 
 const PAGE_SIZE = 10;
 
+interface Verification {
+  status: TxVerificationStatus | "checking" | "unavailable";
+  verifiedAt: string | null;
+  detail?: string;
+}
+
 export function TxHistoryTable() {
   const announce = useAnnounce();
+  const { server } = useGuard();
   const [entries, setEntries] = useState<TxHistoryEntry[]>([]);
+  const [verifications, setVerifications] = useState<Record<string, Verification>>({});
   const [query, setQuery] = useState("");
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
@@ -45,6 +58,43 @@ export function TxHistoryTable() {
     [entries, query, from, to],
   );
   const paged = paginateTxHistory(filtered, page, PAGE_SIZE);
+
+  async function verifyEntry(entry: TxHistoryEntry) {
+    if (!txHistoryMatchesNetwork(entry, NETWORK.passphrase)) return;
+    setVerifications((current) => ({
+      ...current,
+      [entry.hash]: { status: "checking", verifiedAt: null },
+    }));
+    try {
+      const result = await server.getTransaction(entry.hash);
+      const status = txVerificationStatus(String(result.status));
+      const nextStatus = status ?? "unavailable";
+      setVerifications((current) => ({
+        ...current,
+        [entry.hash]: {
+          status: nextStatus,
+          verifiedAt: new Date().toISOString(),
+          ...(status === null
+            ? { detail: `Unrecognized RPC status: ${String(result.status)}` }
+            : {}),
+        },
+      }));
+      announce(
+        `Transaction ${entry.hash.slice(0, 8)} verification: ${verificationLabel(nextStatus)} on ${entry.networkName}`,
+      );
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      setVerifications((current) => ({
+        ...current,
+        [entry.hash]: {
+          status: "unavailable",
+          verifiedAt: new Date().toISOString(),
+          detail,
+        },
+      }));
+      announce(`Transaction ${entry.hash.slice(0, 8)} verification unavailable: ${detail}`);
+    }
+  }
 
   function exportCsv() {
     const csv = txHistoryToCsv(filtered);
@@ -133,8 +183,10 @@ export function TxHistoryTable() {
                   <th>Timestamp</th>
                   <th>Operation</th>
                   <th>Status</th>
+                  <th>Network</th>
                   <th>Tx Hash</th>
                   <th>Gas Fee</th>
+                  <th>Chain verification</th>
                 </tr>
               </thead>
               <tbody>
@@ -151,11 +203,48 @@ export function TxHistoryTable() {
                         <span className="pill danger">Failed</span>
                       )}
                     </td>
+                    <td className="tiny" title={entry.networkPassphrase ?? "Network not recorded"}>
+                      <div>{entry.networkName ?? "Unknown network"}</div>
+                      <div className="muted">{entry.networkPassphrase ?? "Legacy history"}</div>
+                    </td>
                     <td>
                       <TxHashCell hash={entry.hash} />
                     </td>
                     <td className="mono tiny">
                       {entry.feeStroops !== null ? `${entry.feeStroops} stroops` : "—"}
+                    </td>
+                    <td className="tiny">
+                      {txHistoryMatchesNetwork(entry, NETWORK.passphrase) ? (
+                        <button
+                          type="button"
+                          className="secondary"
+                          onClick={() => void verifyEntry(entry)}
+                          disabled={verifications[entry.hash]?.status === "checking"}
+                          aria-label={`Verify transaction ${entry.hash} on ${entry.networkName ?? "recorded network"}`}
+                        >
+                          {verifications[entry.hash]?.status === "checking"
+                            ? "Checking…"
+                            : "Verify"}
+                        </button>
+                      ) : (
+                        <span title="Verification is limited to the exact recorded network passphrase">
+                          Unavailable
+                        </span>
+                      )}
+                      {verifications[entry.hash] && (
+                        <div style={{ marginTop: 4 }}>
+                          <div>Chain: {verificationLabel(verifications[entry.hash]!.status)}</div>
+                          {verifications[entry.hash]!.detail && (
+                            <div className="muted">{verifications[entry.hash]!.detail}</div>
+                          )}
+                          {verifications[entry.hash]!.verifiedAt && (
+                            <div className="muted">
+                              Checked {formatTimestamp(verifications[entry.hash]!.verifiedAt!)} via{" "}
+                              {NETWORK.rpcUrl}
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </td>
                   </tr>
                 ))}
@@ -196,4 +285,21 @@ export function TxHistoryTable() {
 /** Stored timestamps are ISO UTC — show the UTC wall clock so dates sort as written. */
 function formatTimestamp(iso: string): string {
   return `${iso.slice(0, 10)} ${iso.slice(11, 19)}`;
+}
+
+function verificationLabel(status: Verification["status"]): string {
+  switch (status) {
+    case "checking":
+      return "Pending verification";
+    case "not-found":
+      return "Not found";
+    case "pending":
+      return "Pending on network";
+    case "confirmed":
+      return "Confirmed on chain";
+    case "failed":
+      return "Failed on chain";
+    case "unavailable":
+      return "Unavailable";
+  }
 }

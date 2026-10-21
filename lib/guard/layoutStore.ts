@@ -154,6 +154,31 @@ export function reorderPanel(
   return { order };
 }
 
+/** Reorder rendered panels while leaving unavailable panel slots untouched. */
+export function reorderAvailablePanels(
+  layout: DashboardLayout,
+  id: PanelId,
+  toIndex: number,
+  available: readonly PanelId[],
+): DashboardLayout {
+  const positions = layout.order.flatMap((placement, index) =>
+    available.includes(placement.id) ? [index] : [],
+  );
+  const from = positions.findIndex((position) => layout.order[position]?.id === id);
+  if (from === -1) return layout;
+  const target = Math.min(Math.max(0, Math.trunc(toIndex)), positions.length - 1);
+  if (target === from) return layout;
+
+  const visible = positions.map((position) => layout.order[position]!);
+  const [moved] = visible.splice(from, 1);
+  visible.splice(target, 0, moved!);
+  const order = [...layout.order];
+  positions.forEach((position, index) => {
+    order[position] = visible[index]!;
+  });
+  return { order };
+}
+
 /** Move a panel one slot earlier (or later when `down`). No-op at the ends. */
 export function movePanel(
   layout: DashboardLayout,

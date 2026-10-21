@@ -168,6 +168,22 @@ test("a freeze speaks the operator's words, and only once the chain agrees", () 
   );
 });
 
+test("action outcomes identify the guard without changing their urgency", () => {
+  const guard = "C123456789";
+  assert.deepEqual(freezeConfirmed("freeze", guard), {
+    message: `Account frozen for guard ${guard}`,
+    priority: "polite",
+  });
+  assert.deepEqual(freezeFailed("freeze", "RPC rejected the write", guard), {
+    message: `Freeze failed: RPC rejected the write for guard ${guard}`,
+    priority: "assertive",
+  });
+  assert.deepEqual(policyFailed("set_policy", "simulation refused", guard), {
+    message: `Policy install failed: simulation refused for guard ${guard}`,
+    priority: "assertive",
+  });
+});
+
 test("a failure always carries its reason, assertively", () => {
   for (const action of FREEZE_ACTIONS) {
     const spoken = freezeFailed(

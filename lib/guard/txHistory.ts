@@ -14,6 +14,8 @@
  * never to a crash), and tests inject their own storage.
  */
 
+import { NETWORK } from "./network.ts";
+
 export interface TxHistoryEntry {
   /** The hash the network accepted. Identity for de-duplication. */
   hash: string;
@@ -22,8 +24,34 @@ export interface TxHistoryEntry {
   status: "confirmed" | "failed";
   /** Total fee paid, in stroops (inclusion + resource), as a decimal string. */
   feeStroops: string | null;
+  /** Network identity captured when this console recorded the write. */
+  networkName: string | null;
+  networkPassphrase: string | null;
   /** ISO 8601 timestamp of when this console recorded the outcome. */
   recordedAt: string;
+}
+
+export type TxVerificationStatus = "pending" | "not-found" | "confirmed" | "failed";
+
+/** Map the live RPC response to a presentation state without changing history. */
+export function txVerificationStatus(status: string): TxVerificationStatus | null {
+  switch (status) {
+    case "PENDING":
+      return "pending";
+    case "NOT_FOUND":
+      return "not-found";
+    case "SUCCESS":
+      return "confirmed";
+    case "FAILED":
+      return "failed";
+    default:
+      return null;
+  }
+}
+
+/** A history row can be checked only against the exact passphrase it records. */
+export function txHistoryMatchesNetwork(entry: TxHistoryEntry, networkPassphrase: string): boolean {
+  return entry.networkPassphrase === networkPassphrase;
 }
 
 /** Maximum entries kept — the oldest beyond this are dropped. */
@@ -55,6 +83,12 @@ function isEntry(value: unknown): value is TxHistoryEntry {
     typeof entry.operation === "string" &&
     (entry.status === "confirmed" || entry.status === "failed") &&
     typeof entry.recordedAt === "string" &&
+    (entry.networkName === undefined ||
+      entry.networkName === null ||
+      typeof entry.networkName === "string") &&
+    (entry.networkPassphrase === undefined ||
+      entry.networkPassphrase === null ||
+      typeof entry.networkPassphrase === "string") &&
     (entry.feeStroops === null ||
       entry.feeStroops === undefined ||
       typeof entry.feeStroops === "string")
@@ -74,7 +108,12 @@ export function loadTxHistory(storage: StorageLike | null = defaultStorage()): T
     if (!Array.isArray(parsed)) return [];
     return parsed
       .filter(isEntry)
-      .map((entry) => ({ ...entry, feeStroops: entry.feeStroops ?? null }))
+      .map((entry) => ({
+        ...entry,
+        feeStroops: entry.feeStroops ?? null,
+        networkName: entry.networkName ?? null,
+        networkPassphrase: entry.networkPassphrase ?? null,
+      }))
       .slice(0, TX_HISTORY_LIMIT);
   } catch {
     return [];
@@ -104,7 +143,7 @@ function notify(): void {
  */
 export function recordTx(
   entry: Pick<TxHistoryEntry, "hash" | "operation" | "status" | "feeStroops"> &
-    Partial<Pick<TxHistoryEntry, "recordedAt">>,
+    Partial<Pick<TxHistoryEntry, "recordedAt" | "networkName" | "networkPassphrase">>,
   storage: StorageLike | null = defaultStorage(),
 ): TxHistoryEntry[] {
   const recorded: TxHistoryEntry = {
@@ -112,6 +151,8 @@ export function recordTx(
     operation: entry.operation,
     status: entry.status,
     feeStroops: entry.feeStroops ?? null,
+    networkName: entry.networkName ?? NETWORK.name,
+    networkPassphrase: entry.networkPassphrase ?? NETWORK.passphrase,
     recordedAt: entry.recordedAt ?? new Date().toISOString(),
   };
   const current = loadTxHistory(storage);
@@ -150,7 +191,8 @@ export function filterTxHistory(
   if (query.length === 0 && from.length === 0 && to.length === 0) return entries;
   return entries.filter((entry) => {
     if (query.length > 0) {
-      const haystack = `${entry.operation} ${entry.hash} ${entry.status}`.toLowerCase();
+      const haystack =
+        `${entry.operation} ${entry.hash} ${entry.status} ${entry.networkName ?? ""} ${entry.networkPassphrase ?? ""}`.toLowerCase();
       if (!haystack.includes(query)) return false;
     }
     const day = entry.recordedAt.slice(0, 10);
@@ -187,10 +229,18 @@ function csvCell(value: string): string {
 
 /** The filtered history as CSV: a fixed header plus one quoted row per entry. */
 export function txHistoryToCsv(entries: TxHistoryEntry[]): string {
-  const lines = ["timestamp,operation,status,tx_hash,fee_stroops"];
+  const lines = ["timestamp,operation,status,tx_hash,fee_stroops,network_name,network_passphrase"];
   for (const entry of entries) {
     lines.push(
-      [entry.recordedAt, entry.operation, entry.status, entry.hash, entry.feeStroops ?? ""]
+      [
+        entry.recordedAt,
+        entry.operation,
+        entry.status,
+        entry.hash,
+        entry.feeStroops ?? "",
+        entry.networkName ?? "",
+        entry.networkPassphrase ?? "",
+      ]
         .map(csvCell)
         .join(","),
     );

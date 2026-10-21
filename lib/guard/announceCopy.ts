@@ -63,8 +63,8 @@ const POLICY_HEAD: Record<PolicyOperation, string> = {
  * low-level write path has already announced the transaction itself, and a
  * second interruption for the same action would be noise.
  */
-export function freezeConfirmed(action: FreezeAction): Spoken {
-  return { message: FREEZE_CONFIRMED[action], priority: "polite" };
+export function freezeConfirmed(action: FreezeAction, guard?: string): Spoken {
+  return withGuard({ message: FREEZE_CONFIRMED[action], priority: "polite" }, guard);
 }
 
 /**
@@ -75,8 +75,8 @@ export function freezeConfirmed(action: FreezeAction): Spoken {
  * that announces a freeze assertively, and therefore the only place where one is
  * announced without a chain re-read behind it.
  */
-export function freezeSubmitted(): Spoken {
-  return { message: "Admin freeze activated", priority: "assertive" };
+export function freezeSubmitted(guard?: string): Spoken {
+  return withGuard({ message: "Admin freeze activated", priority: "assertive" }, guard);
 }
 
 /**
@@ -84,18 +84,28 @@ export function freezeSubmitted(): Spoken {
  * contract's own words, the network's rejection, or the note explaining that the
  * re-read disagreed with the write.
  */
-export function freezeFailed(action: FreezeAction, reason: string): Spoken {
-  return { message: `${ACTION_HEAD[action]} failed: ${reason}`, priority: "assertive" };
+export function freezeFailed(action: FreezeAction, reason: string, guard?: string): Spoken {
+  return withGuard(
+    { message: `${ACTION_HEAD[action]} failed: ${reason}`, priority: "assertive" },
+    guard,
+  );
 }
 
 /** `set_policy` / `revoke_policy` landed. */
-export function policyConfirmed(operation: PolicyOperation): Spoken {
-  return { message: POLICY_CONFIRMED[operation], priority: "polite" };
+export function policyConfirmed(operation: PolicyOperation, guard?: string): Spoken {
+  return withGuard({ message: POLICY_CONFIRMED[operation], priority: "polite" }, guard);
 }
 
 /** `set_policy` / `revoke_policy` was refused, rejected, or never completed. */
-export function policyFailed(operation: PolicyOperation, reason: string): Spoken {
-  return { message: `${POLICY_HEAD[operation]} failed: ${reason}`, priority: "assertive" };
+export function policyFailed(operation: PolicyOperation, reason: string, guard?: string): Spoken {
+  return withGuard(
+    { message: `${POLICY_HEAD[operation]} failed: ${reason}`, priority: "assertive" },
+    guard,
+  );
+}
+
+function withGuard(spoken: Spoken, guard?: string): Spoken {
+  return guard ? { ...spoken, message: `${spoken.message} for guard ${guard}` } : spoken;
 }
 
 /** The feed's table was frozen while polling carried on behind it. */

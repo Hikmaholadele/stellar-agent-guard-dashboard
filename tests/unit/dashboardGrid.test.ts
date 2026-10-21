@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { test, before, afterEach } from "node:test";
+import { installDom, loadReact, type Act } from "./domHarness.ts";
+import { DashboardGrid, type GridPanel } from "../../components/DashboardGrid.tsx";
+import { clearAnnouncements, pendingAnnouncements } from "../../lib/guard/useAnnounce.ts";
 import {
   DEFAULT_LAYOUT,
   LAYOUT_STORAGE_KEY,
   defaultLayout,
   loadLayout,
   movePanel,
+  reorderAvailablePanels,
   normalizeLayout,
   reorderPanel,
   resetLayout,
@@ -15,6 +19,28 @@ import {
   type PanelId,
   type StorageLike,
 } from "../../lib/guard/layoutStore.ts";
+
+let React: typeof import("react");
+let createRoot: typeof import("react-dom/client").createRoot;
+let act: Act;
+let root: ReturnType<typeof createRoot> | null = null;
+
+before(async () => {
+  installDom();
+  const loaded = await loadReact();
+  React = loaded.react;
+  createRoot = loaded.createRoot;
+  act = loaded.act;
+});
+
+afterEach(() => {
+  if (root) {
+    act(() => root!.unmount());
+    root = null;
+  }
+  document.body.innerHTML = "";
+  localStorage.clear();
+});
 
 function fakeStorage(): StorageLike & { data: Map<string, string> } {
   const data = new Map<string, string>();
@@ -121,6 +147,17 @@ test("reorderPanel clamps out-of-range indices and no-ops when already there", (
   assert.deepEqual(ids(reorderPanel(defaultLayout(), "status", 0)), [...DEFAULT_LAYOUT]);
 });
 
+test("reordering available panels preserves missing slots and persists through reset", () => {
+  const storage = fakeStorage();
+  const available: PanelId[] = ["status", "telemetry", "xdr"];
+  const moved = reorderAvailablePanels(defaultLayout(), "telemetry", 0, available);
+  assert.deepEqual(ids(moved), ["telemetry", "txhistory", "panic", "status", "multisig", "xdr"]);
+  saveLayout(moved, storage);
+  assert.deepEqual(ids(loadLayout(storage)), ids(moved));
+  assert.deepEqual(ids(resetLayout()), [...DEFAULT_LAYOUT]);
+  assert.equal(reorderAvailablePanels(moved, "panic", 0, available), moved);
+});
+
 test("movePanel steps a panel one slot and refuses to run off the ends", () => {
   const up = movePanel(defaultLayout(), "txhistory", "up");
   assert.deepEqual(ids(up)[0], "txhistory");
@@ -153,4 +190,61 @@ test("resetLayout restores the default arrangement regardless of current state",
 test("loadLayout with no storage returns the default (server render, private mode)", () => {
   assert.deepEqual(ids(loadLayout(null)), [...DEFAULT_LAYOUT]);
   assert.deepEqual(saveLayout(defaultLayout(), null), undefined);
+});
+
+test("keyboard move controls use rendered-panel boundaries and reset persisted order", async () => {
+  clearAnnouncements();
+  const div = document.createElement("div");
+  document.body.appendChild(div);
+  root = createRoot(div);
+  const panels: GridPanel[] = [
+    { id: "status", title: "Status panel", content: React.createElement("p", null, "status") },
+    {
+      id: "telemetry",
+      title: "Telemetry panel",
+      content: React.createElement("p", null, "telemetry"),
+    },
+  ];
+  await act(() => {
+    root!.render(React.createElement(DashboardGrid, { panels }));
+  });
+  await act(async () => {
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+  });
+
+  const statusMoveUp = div.querySelector(
+    'button[aria-label="Move Status panel earlier"]',
+  ) as HTMLButtonElement;
+  const telemetryMoveDown = div.querySelector(
+    'button[aria-label="Move Telemetry panel later"]',
+  ) as HTMLButtonElement;
+  assert.equal(statusMoveUp.disabled, true);
+  assert.equal(telemetryMoveDown.disabled, true);
+
+  const statusMoveDown = div.querySelector(
+    'button[aria-label="Move Status panel later"]',
+  ) as HTMLButtonElement;
+  await act(() => statusMoveDown.click());
+  assert.ok(div.querySelector("section:nth-child(1) h2")?.textContent?.includes("Telemetry panel"));
+  assert.ok(
+    pendingAnnouncements().some((item) => item.message === "Status panel moved to position 2 of 2"),
+  );
+  const stored = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY) ?? "[]") as { id: PanelId }[];
+  assert.deepEqual(
+    stored.map((placement) => placement.id),
+    ["telemetry", "txhistory", "panic", "status", "multisig", "xdr"],
+  );
+
+  const resetButton = [...div.querySelectorAll("button")].find(
+    (button) => button.textContent === "Reset Layout",
+  );
+  assert.ok(resetButton);
+  await act(() => resetButton.click());
+  const resetOrder = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY) ?? "[]") as {
+    id: PanelId;
+  }[];
+  assert.deepEqual(
+    resetOrder.map((placement) => placement.id),
+    [...DEFAULT_LAYOUT],
+  );
 });

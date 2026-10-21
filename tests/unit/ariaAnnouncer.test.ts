@@ -131,6 +131,30 @@ test("critical alerts are spoken into the assertive region", async () => {
   }
 });
 
+test("an assertive transaction outcome is still spoken after its dialog closes", async () => {
+  clearAnnouncements();
+  const mounted = await mountAnnouncer();
+  const dialogContainer = document.createElement("div");
+  document.body.appendChild(dialogContainer);
+  const dialogRoot = createRoot(dialogContainer);
+  await act(async () => {
+    dialogRoot.render(react.createElement("div", { role: "dialog" }, "Submitting transaction"));
+    announce("Policy install failed for guard GABC: RPC rejected the write", "assertive");
+    dialogRoot.unmount();
+  });
+  try {
+    assert.equal(dialogContainer.querySelector('[role="dialog"]'), null);
+    await settle(150);
+    assert.equal(
+      mounted.assertive.textContent,
+      "Policy install failed for guard GABC: RPC rejected the write",
+    );
+  } finally {
+    dialogContainer.remove();
+    await mounted.unmount();
+  }
+});
+
 test("rapid distinct messages queue and drain one at a time, in order", async () => {
   clearAnnouncements();
   const mounted = await mountAnnouncer();

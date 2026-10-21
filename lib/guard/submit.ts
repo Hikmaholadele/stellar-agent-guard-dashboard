@@ -657,7 +657,7 @@ async function runInvocation(request: InvokeRequest): Promise<InvokeResult> {
     };
   }
 
-  announce("Transaction submitted to network");
+  announce(`Transaction ${request.fn} submitted to network for guard ${request.contract}`);
 
   const included = await pollForInclusion(
     server,
@@ -698,29 +698,34 @@ async function runInvocation(request: InvokeRequest): Promise<InvokeResult> {
  */
 export async function invokeWithWallet(request: InvokeRequest): Promise<InvokeResult> {
   const result = await runInvocation(request);
+  const context = `for guard ${request.contract}`;
   if (result.kind === "exported") {
-    announce("Transaction XDR exported for offline signing");
+    announce(`Transaction XDR exported for offline signing ${context}`);
   } else if (result.kind === "refused") {
-    announce("Transaction refused — nothing was broadcast");
+    announce(`Transaction refused — nothing was broadcast ${context}`, "assertive");
   } else if (result.kind === "failed") {
     recordTx({
       hash: result.hash,
       operation: request.fn,
       status: "failed",
       feeStroops: result.feeStroops ?? null,
+      networkName: NETWORK.name,
+      networkPassphrase: request.passphrase ?? NETWORK.passphrase,
     });
-    announce("Transaction failed on chain");
+    announce(`Transaction failed on chain ${context}`, "assertive");
   } else if (result.kind === "submitted") {
     recordTx({
       hash: result.hash,
       operation: request.fn,
       status: "confirmed",
       feeStroops: result.feeStroops ?? null,
+      networkName: NETWORK.name,
+      networkPassphrase: request.passphrase ?? NETWORK.passphrase,
     });
     announce(
       result.ledger !== null && result.status === rpc.Api.GetTransactionStatus.SUCCESS
-        ? `Transaction confirmed on ledger ${result.ledger}`
-        : "Transaction confirmed on the network",
+        ? `Transaction confirmed on ledger ${result.ledger} ${context}`
+        : `Transaction confirmed on the network ${context}`,
     );
     // Only the transaction is announced here, never what the operator meant by
     // it. A freeze's *effect* is claimed by whoever can verify it: the panic
