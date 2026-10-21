@@ -98,6 +98,15 @@ function DmsAlertBanner({ alert, stale }: { alert: DmsAlert; stale: boolean }) {
   );
 }
 
+function useNowMs(): number {
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const interval = window.setInterval(() => setNowMs(Date.now()), 5_000);
+    return () => window.clearInterval(interval);
+  }, []);
+  return nowMs;
+}
+
 /**
  * Copyable failure context (issue #347).
  *
