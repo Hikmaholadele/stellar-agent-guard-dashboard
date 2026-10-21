@@ -20,6 +20,8 @@ import {
   sourceRows,
   type MigrationPlan,
   type CompatibilityReport,
+  type FieldConversion,
+  type FieldConversionStatus,
 } from "../lib/guard/migration.ts";
 import { useGuard } from "./GuardProvider.tsx";
 import { ErrorBlock, starLink } from "./bits.tsx";
@@ -320,6 +322,80 @@ function CompatibilityView({ report }: { report: CompatibilityReport }) {
           {note}
         </p>
       ))}
+
+      {/* Field-by-field conversion details */}
+      {report.fieldConversions && report.fieldConversions.length > 0 && (
+        <details className="stack" style={{ marginTop: 12 }}>
+          <summary>Field-by-field conversion details</summary>
+          <p className="tiny muted">
+            Each row shows how a source field maps to the target policy. Status codes:
+            <code>copied</code> = identical, <code>transformed</code> = type converted,
+            <code>defaulted</code> = missing (uses zero/empty), <code>unsupported</code> = dropped,
+            <code>type-error</code> = blocks migration, <code>missing-required</code> = blocks
+            migration.
+          </p>
+          <div className="scrolly">
+            <table className="events">
+              <thead>
+                <tr>
+                  <th>Target Field</th>
+                  <th>Source Field</th>
+                  <th>Source Value</th>
+                  <th>Converted Value</th>
+                  <th>Status</th>
+                  <th>Details</th>
+                </tr>
+              </thead>
+              <tbody>
+                {report.fieldConversions.map((conv, index) => (
+                  <FieldConversionRow key={index} conversion={conv} />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </details>
+      )}
     </div>
+  );
+}
+
+function FieldConversionRow({ conversion }: { conversion: FieldConversion }) {
+  const statusColors: Record<FieldConversionStatus, string> = {
+    copied: "var(--ok)",
+    transformed: "var(--warn)",
+    defaulted: "var(--warn)",
+    unsupported: "var(--danger)",
+    unchanged: "var(--ok)",
+    "type-error": "var(--danger)",
+    "missing-required": "var(--danger)",
+  };
+
+  const formatValue = (value: unknown): string => {
+    if (value === undefined) return "<em>absent</em>";
+    if (value === null) return "<em>null</em>";
+    if (typeof value === "bigint") return value.toString();
+    if (Array.isArray(value)) return `[${value.join(", ")}]`;
+    return String(value);
+  };
+
+  return (
+    <tr style={{ borderLeft: `3px solid ${statusColors[conversion.status]}` }}>
+      <td className="mono tiny">{conversion.targetField}</td>
+      <td className="mono tiny">{conversion.sourceField ?? "<em>none</em>"}</td>
+      <td
+        className="mono tiny"
+        dangerouslySetInnerHTML={{ __html: formatValue(conversion.sourceValue) }}
+      />
+      <td
+        className="mono tiny"
+        dangerouslySetInnerHTML={{ __html: formatValue(conversion.convertedValue) }}
+      />
+      <td>
+        <span className="pill" style={{ background: statusColors[conversion.status] }}>
+          {conversion.status}
+        </span>
+      </td>
+      <td className="tiny">{conversion.detail}</td>
+    </tr>
   );
 }

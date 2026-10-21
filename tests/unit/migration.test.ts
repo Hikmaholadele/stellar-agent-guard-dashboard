@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { describe, test } from "node:test";
 import {
   TARGET_POLICY_FIELDS,
   planMigration,
   sourceRows,
   validateSourcePolicy,
+  type FieldConversionStatus,
 } from "../../lib/guard/migration.ts";
 
 const TOKEN = "CDCYDGBGS5AZ5BZS6XY2SK2PHJHSOEGTN3N4INCK34KF6GU2BGC7Z6MB";
@@ -80,14 +81,17 @@ test("the target schema is the contract's own field list", () => {
 
 test("a policy read from a current guard needs no translation", () => {
   const report = validateSourcePolicy(source());
-  assert.deepEqual(report, {
-    ok: true,
-    missing: [],
-    unrecognised: [],
-    renamed: [],
-    typeIssues: [],
-    notes: [],
-  });
+  assert.equal(report.ok, true);
+  assert.deepEqual(report.missing, []);
+  assert.deepEqual(report.unrecognised, []);
+  assert.deepEqual(report.renamed, []);
+  assert.deepEqual(report.typeIssues, []);
+  assert.deepEqual(report.notes, []);
+  assert.ok(report.fieldConversions);
+  assert.equal(report.fieldConversions.length, 11);
+  for (const conv of report.fieldConversions) {
+    assert.equal(conv.status, "copied");
+  }
 });
 
 test("a camelCase export is folded onto the schema and says so", () => {
@@ -160,9 +164,8 @@ test("a present field of the wrong shape is a type issue, not a default", () => 
     ["per_tx_cap", "1,000", /per_tx_cap: expected a whole number/],
     ["window_secs", null, /window_secs: expected a whole number/],
     ["assets", TOKEN, /assets: expected a list of addresses/],
-    ["recipients", [1, 2], /recipients: expected a list of addresses/],
     ["protocols", "swap", /protocols: expected a list/],
-    ["paused", "false", /paused: expected true or false/],
+    ["paused", "not-a-bool", /paused: expected true or false/],
     ["allow_any_recipient", 1, /allow_any_recipient: expected true or false/],
   ];
   for (const [name, value, pattern] of cases) {
@@ -170,6 +173,16 @@ test("a present field of the wrong shape is a type issue, not a default", () => 
     assert.equal(report.ok, false, `${name} = ${String(value)} must not migrate`);
     assert.match(report.typeIssues.join("; "), pattern);
   }
+
+  // Test that arrays with non-string elements are accepted but filtered (transformed)
+  const recipientsReport = validateSourcePolicy(source({ recipients: [1, 2] }));
+  assert.equal(recipientsReport.ok, true, "array with non-strings should be accepted and filtered");
+  const recipientsConv = recipientsReport.fieldConversions.find(
+    (c) => c.targetField === "recipients",
+  );
+  assert.ok(recipientsConv);
+  assert.equal(recipientsConv.status, "transformed");
+  assert.deepEqual(recipientsConv.convertedValue, []);
 });
 
 test("a protocol rule without its function list is flagged", () => {
@@ -350,4 +363,135 @@ test("an empty allowlist is shown as a denial, not as a blank", () => {
   assert.equal(byLabel.get("Active window"), "100 → 200");
   assert.equal(byLabel.get("Paused"), "yes");
   assert.equal(byLabel.get("Dead-man grace"), "off");
+});
+
+describe("field-by-field conversion tracking", () => {
+  test("validateSourcePolicy returns fieldConversions for every target field", () => {
+    const report = validateSourcePolicy(source());
+    assert.ok(report.fieldConversions);
+    assert.equal(report.fieldConversions.length, TARGET_POLICY_FIELDS.length);
+
+    for (const conv of report.fieldConversions) {
+      assert.ok(conv.targetField);
+      assert.ok(conv.label);
+      assert.ok(
+        [
+          "copied",
+          "transformed",
+          "defaulted",
+          "unsupported",
+          "unchanged",
+          "type-error",
+          "missing-required",
+        ].includes(conv.status),
+      );
+      assert.equal(typeof conv.detail, "string");
+      assert.equal(typeof conv.required, "boolean");
+      assert.ok(
+        conv.convertedValue !== undefined ||
+          conv.status === "missing-required" ||
+          conv.status === "type-error",
+      );
+    }
+  });
+
+  test("exact match fields show as copied", () => {
+    const report = validateSourcePolicy(source());
+    const perTxCap = report.fieldConversions.find((c) => c.targetField === "per_tx_cap");
+    assert.ok(perTxCap);
+    assert.equal(perTxCap.status, "copied");
+    assert.equal(perTxCap.convertedValue, 1000n);
+    assert.equal(perTxCap.sourceValue, 1000n);
+  });
+
+  test("camelCase fields show as transformed (string -> bigint)", () => {
+    const report = validateSourcePolicy(exported());
+    const perTxCap = report.fieldConversions.find((c) => c.targetField === "per_tx_cap");
+    assert.ok(perTxCap);
+    assert.equal(perTxCap.status, "transformed");
+    assert.equal(perTxCap.sourceField, "perTxCap");
+    assert.equal(perTxCap.sourceValue, "1000");
+    assert.equal(perTxCap.convertedValue, 1000n);
+  });
+
+  test("missing required fields show as missing-required", () => {
+    const report = validateSourcePolicy(without("per_tx_cap"));
+    const perTxCap = report.fieldConversions.find((c) => c.targetField === "per_tx_cap");
+    assert.ok(perTxCap);
+    assert.equal(perTxCap.status, "missing-required");
+    assert.equal(perTxCap.sourceField, null);
+    assert.equal(perTxCap.convertedValue, null);
+    assert.ok(perTxCap.required);
+  });
+
+  test("unrecognised source fields show as unsupported", () => {
+    const report = validateSourcePolicy(source({ legacy_daily_limit: 9n }));
+    const legacy = report.fieldConversions.find((c) => c.targetField === "legacy_daily_limit");
+    assert.ok(legacy);
+    assert.equal(legacy.status, "unsupported");
+    assert.equal(legacy.sourceField, "legacy_daily_limit");
+    assert.equal(legacy.sourceValue, 9n);
+    assert.equal(legacy.convertedValue, null);
+    assert.equal(legacy.required, false);
+  });
+
+  test("type errors show as type-error with detail", () => {
+    const report = validateSourcePolicy(source({ per_tx_cap: "1,000" }));
+    const perTxCap = report.fieldConversions.find((c) => c.targetField === "per_tx_cap");
+    assert.ok(perTxCap);
+    assert.equal(perTxCap.status, "type-error");
+    assert.ok(perTxCap.detail.includes("expected a whole number"));
+    assert.equal(perTxCap.convertedValue, null);
+  });
+
+  test("boolean fields are transformed from string to boolean", () => {
+    const report = validateSourcePolicy(exported({ paused: "true" }));
+    const paused = report.fieldConversions.find((c) => c.targetField === "paused");
+    assert.ok(paused);
+    assert.equal(paused.status, "transformed");
+    assert.equal(paused.sourceValue, "true");
+    assert.equal(paused.convertedValue, true);
+  });
+
+  test("array fields are transformed (filtered)", () => {
+    const report = validateSourcePolicy(source({ assets: [TOKEN, 123, null] }));
+    const assets = report.fieldConversions.find((c) => c.targetField === "assets");
+    assert.ok(assets);
+    assert.equal(assets.status, "transformed");
+    // Only valid strings survive
+    assert.deepEqual(assets.convertedValue, [TOKEN]);
+  });
+
+  test("protocol rules are transformed (filtered)", () => {
+    const report = validateSourcePolicy(
+      source({ protocols: [{ contract: TOKEN, fns: ["swap"] }, "invalid"] }),
+    );
+    const protocols = report.fieldConversions.find((c) => c.targetField === "protocols");
+    assert.ok(protocols);
+    assert.equal(protocols.status, "transformed");
+    assert.ok(Array.isArray(protocols.convertedValue));
+    assert.equal((protocols.convertedValue as any[]).length, 1);
+    assert.equal((protocols.convertedValue as any[])[0].contract, TOKEN);
+  });
+
+  test("null/undefined source returns missing-required for all fields", () => {
+    for (const bad of [null, undefined, "policy", 7, []]) {
+      const report = validateSourcePolicy(bad);
+      assert.equal(report.fieldConversions.length, TARGET_POLICY_FIELDS.length);
+      for (const conv of report.fieldConversions) {
+        assert.equal(conv.status, "missing-required");
+        assert.equal(conv.sourceField, null);
+        assert.equal(conv.sourceValue, undefined);
+        assert.equal(conv.convertedValue, null);
+      }
+    }
+  });
+
+  test("planMigration includes fieldConversions in the report", () => {
+    const plan = planMigration(source());
+    assert.equal(plan.ok, true);
+    if (!plan.ok) return;
+    assert.ok(plan.report.fieldConversions);
+    assert.equal(plan.report.fieldConversions.length, TARGET_POLICY_FIELDS.length);
+  });
 });

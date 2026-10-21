@@ -256,3 +256,167 @@ export function tabForPathname(pathname: string): UrlTab {
 export function routeForTab(tab: UrlTab): string | null {
   return SCREEN_ROUTES[tab] ?? null;
 }
+
+/**
+ * Validation result for a URL state parameter.
+ */
+export type ParamValidation<T> =
+  | { status: "valid"; value: T }
+  | { status: "malformed"; raw: string; reason: string }
+  | { status: "conflicting"; requested: T; current: T }
+  | { status: "ambiguous"; values: T[] }
+  | { status: "absent" };
+
+/**
+ * Validation result for the complete URL state.
+ */
+export interface UrlStateValidation {
+  guard: ParamValidation<string>;
+  network: ParamValidation<string>;
+  tab: ParamValidation<UrlTab>;
+  filter: ParamValidation<VerdictFilter>;
+  /** True when any parameter was malformed, ambiguous, or conflicting. */
+  hasIssues: boolean;
+}
+
+/**
+ * Validate the guard parameter.
+ */
+function validateGuard(raw: string | null | undefined, current?: string): ParamValidation<string> {
+  if (raw === null || raw === undefined || raw.trim() === "") return { status: "absent" };
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith("C"))
+    return { status: "malformed", raw: trimmed, reason: "contract address must start with 'C'" };
+  if (trimmed.length < 56)
+    return { status: "malformed", raw: trimmed, reason: "contract address too short" };
+  if (trimmed.length > 56)
+    return { status: "malformed", raw: trimmed, reason: "contract address too long" };
+  if (!looksLikeContractAddress(trimmed))
+    return { status: "malformed", raw: trimmed, reason: "invalid base32 encoding" };
+  if (current !== undefined && trimmed !== current)
+    return { status: "conflicting", requested: trimmed, current };
+  return { status: "valid", value: trimmed };
+}
+
+/**
+ * Validate the network parameter.
+ */
+function validateNetwork(
+  raw: string | null | undefined,
+  current?: string,
+): ParamValidation<string> {
+  if (raw === null || raw === undefined || raw.trim() === "") return { status: "absent" };
+  const trimmed = raw.trim().toLowerCase();
+  if (!isKnownNetwork(trimmed))
+    return { status: "malformed", raw: trimmed, reason: "unknown network" };
+  if (current !== undefined && trimmed !== current)
+    return { status: "conflicting", requested: trimmed, current };
+  return { status: "valid", value: trimmed };
+}
+
+/**
+ * Validate the tab parameter.
+ */
+function validateTab(raw: string | null | undefined, current?: UrlTab): ParamValidation<UrlTab> {
+  if (raw === null || raw === undefined || raw.trim() === "") return { status: "absent" };
+  const trimmed = raw.trim().toLowerCase() as UrlTab;
+  if (!isUrlTab(trimmed)) return { status: "malformed", raw: trimmed, reason: "unknown tab" };
+  if (current !== undefined && trimmed !== current)
+    return { status: "conflicting", requested: trimmed, current };
+  return { status: "valid", value: trimmed };
+}
+
+/**
+ * Validate the filter parameter.
+ */
+function validateFilter(
+  raw: string | null | undefined,
+  current?: VerdictFilter,
+): ParamValidation<VerdictFilter> {
+  if (raw === null || raw === undefined || raw.trim() === "") return { status: "absent" };
+  const trimmed = raw.trim().toLowerCase() as VerdictFilter;
+  if (!isVerdictFilter(trimmed))
+    return { status: "malformed", raw: trimmed, reason: "unknown filter" };
+  if (current !== undefined && trimmed !== current)
+    return { status: "conflicting", requested: trimmed, current };
+  return { status: "valid", value: trimmed };
+}
+
+function checkAmbiguousGuards(values: string[]): ParamValidation<string> | null {
+  if (values.length <= 1) return null;
+  const unique = [...new Set(values)];
+  if (unique.length > 1) return { status: "ambiguous", values: unique };
+  return null;
+}
+
+function checkAmbiguousNetworks(values: string[]): ParamValidation<string> | null {
+  if (values.length <= 1) return null;
+  const unique = [...new Set(values)];
+  if (unique.length > 1) return { status: "ambiguous", values: unique };
+  return null;
+}
+
+function checkAmbiguousTabs(values: string[]): ParamValidation<UrlTab> | null {
+  if (values.length <= 1) return null;
+  const unique = [...new Set(values)];
+  if (unique.length > 1) return { status: "ambiguous", values: unique as UrlTab[] };
+  return null;
+}
+
+function checkAmbiguousFilters(values: string[]): ParamValidation<VerdictFilter> | null {
+  if (values.length <= 1) return null;
+  const unique = [...new Set(values)];
+  if (unique.length > 1) return { status: "ambiguous", values: unique as VerdictFilter[] };
+  return null;
+}
+
+/**
+ * Validate all four URL state parameters from a search string, returning
+ * detailed results for each so the UI can surface clear messages when
+ * a parameter is rejected.
+ */
+export function validateUrlState(search: string, current?: Partial<UrlState>): UrlStateValidation {
+  const params = new URLSearchParams(search);
+
+  const tabVocabulary = new Set(URL_TABS);
+  const filterVocabulary = new Set(VERDICT_FILTERS);
+
+  const guardRaw = params.get(URL_STATE_PARAMS.guard)?.trim();
+  const networkRaw = params.get(URL_STATE_PARAMS.network)?.trim().toLowerCase();
+  const tabRaw = params.get(URL_STATE_PARAMS.tab)?.trim().toLowerCase();
+  const filterRaw = params.get(URL_STATE_PARAMS.filter)?.trim().toLowerCase();
+
+  // Check for ambiguous (duplicate) parameters
+  const allGuards = params
+    .getAll(URL_STATE_PARAMS.guard)
+    .map((v) => v.trim())
+    .filter((v) => v.length > 0);
+  const allNetworks = params
+    .getAll(URL_STATE_PARAMS.network)
+    .map((v) => v.trim().toLowerCase())
+    .filter((v) => v.length > 0);
+  const allTabs = params
+    .getAll(URL_STATE_PARAMS.tab)
+    .map((v) => v.trim().toLowerCase())
+    .filter((v) => v.length > 0);
+  const allFilters = params
+    .getAll(URL_STATE_PARAMS.filter)
+    .map((v) => v.trim().toLowerCase())
+    .filter((v) => v.length > 0);
+
+  const guardAmbiguous = checkAmbiguousGuards(allGuards);
+  const networkAmbiguous = checkAmbiguousNetworks(allNetworks);
+  const tabAmbiguous = checkAmbiguousTabs(allTabs);
+  const filterAmbiguous = checkAmbiguousFilters(allFilters);
+
+  const guard = guardAmbiguous ?? validateGuard(guardRaw, current?.guard);
+  const network = networkAmbiguous ?? validateNetwork(networkRaw, current?.network);
+  const tab = tabAmbiguous ?? validateTab(tabRaw, current?.tab);
+  const filter = filterAmbiguous ?? validateFilter(filterRaw, current?.filter);
+
+  const hasIssues = [guard, network, tab, filter].some(
+    (p) => p.status !== "valid" && p.status !== "absent",
+  );
+
+  return { guard, network, tab, filter, hasIssues };
+}

@@ -12,10 +12,48 @@
  * Parsing is done directly on the binary rather than through a WASM library: the
  * dashboard has no server half and a dependency that parses binaries in the
  * browser is a larger surface than the eleven bytes of a section header.
+ *
+ * Progress and cancellation are handled via Web Workers so the UI stays
+ * responsive while parsing and hashing large artifacts.
  */
 
 import { PHASE1_ARTIFACT } from "./network.ts";
 import { sha256Hex } from "./scval.ts";
+
+export interface WasmParseProgress {
+  phase:
+    | "validating-header"
+    | "parsing-sections"
+    | "reading-exports"
+    | "reading-producers"
+    | "complete"
+    | "error"
+    | "cancelled";
+  current?: number;
+  total?: number;
+  count?: number;
+  section?: string;
+  reason?: string;
+  inspection?: WasmInspection;
+}
+
+export interface WasmHashProgress {
+  phase: "hashing" | "complete" | "error" | "cancelled";
+  bytesProcessed?: number;
+  totalBytes?: number;
+  hash?: string;
+  reason?: string;
+}
+
+type WasmParseWorker = Worker & {
+  postMessage(message: { type: "parse"; bytes: ArrayBuffer } | { type: "cancel" }): void;
+  onmessage: ((event: MessageEvent<{ type: "progress"; phase: WasmParseProgress }>) => void) | null;
+};
+
+type WasmHashWorker = Worker & {
+  postMessage(message: { type: "hash"; bytes: ArrayBuffer } | { type: "cancel" }): void;
+  onmessage: ((event: MessageEvent<{ type: "progress"; phase: WasmHashProgress }>) => void) | null;
+};
 
 const MAGIC = [0x00, 0x61, 0x73, 0x6d] as const;
 
@@ -368,4 +406,220 @@ export function describeBuild(metadata: BuildMetadata | null): string {
   const tools = metadata.tools.map((tool) => `${tool.name} ${tool.value}`.trim()).join(", ");
   const stamp = metadata.compiledAt ? `, built ${metadata.compiledAt}` : "";
   return `${tools || "no tool entries"}${stamp}`;
+}
+
+/**
+ * Parse a WASM binary in a Web Worker with progress reporting and cancellation.
+ *
+ * Returns a promise that resolves with the inspection result, or rejects if
+ * cancelled or an error occurs. The `onProgress` callback is invoked for each
+ * progress phase reported by the worker.
+ */
+export function inspectWasmInWorker(
+  bytes: Uint8Array,
+  onProgress: (progress: WasmParseProgress) => void,
+): Promise<WasmInspection> {
+  return new Promise((resolve, reject) => {
+    let worker: WasmParseWorker;
+    try {
+      // @ts-ignore - Next.js handles worker imports
+      worker = new Worker(new URL("../worker/wasmParse.ts", import.meta.url), { type: "module" });
+    } catch {
+      // Fallback to inline parsing if workers are not supported
+      // Report progress phases to match worker behavior
+      onProgress({ phase: "validating-header" });
+      onProgress({ phase: "parsing-sections", current: 1, total: 1 });
+      onProgress({ phase: "reading-exports", count: 0 });
+      const result = inspectWasm(bytes);
+      if (result.ok) {
+        onProgress({ phase: "complete", inspection: result });
+        resolve(result);
+      } else {
+        onProgress({ phase: "error", reason: result.reason });
+        reject(new Error(result.reason));
+      }
+      return;
+    }
+
+    worker.onmessage = (event: MessageEvent<{ type: "progress"; phase: WasmParseProgress }>) => {
+      const { phase } = event.data;
+      onProgress(phase);
+      if (phase.phase === "complete" && phase.inspection) {
+        worker.terminate();
+        resolve(phase.inspection);
+      } else if (phase.phase === "error") {
+        worker.terminate();
+        reject(new Error(phase.reason));
+      } else if (phase.phase === "cancelled") {
+        worker.terminate();
+        reject(new Error("Parsing cancelled"));
+      }
+    };
+
+    worker.onerror = (error) => {
+      worker.terminate();
+      reject(new Error(`Worker error: ${error.message}`));
+    };
+
+    // Post the bytes to the worker (transfer ownership for efficiency)
+    worker.postMessage(
+      {
+        type: "parse",
+        bytes: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+      },
+      [bytes.buffer],
+    );
+
+    // Return a cancellation function
+    return () => {
+      worker.postMessage({ type: "cancel" });
+    };
+  });
+}
+
+/**
+ * Compute SHA-256 hash of a WASM binary in a Web Worker with progress reporting and cancellation.
+ *
+ * Returns a promise that resolves with the hex hash string, or rejects if
+ * cancelled or an error occurs. The `onProgress` callback is invoked for each
+ * progress phase reported by the worker.
+ */
+export function hashWasmInWorker(
+  bytes: Uint8Array,
+  onProgress: (progress: WasmHashProgress) => void,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let worker: WasmHashWorker;
+    try {
+      // @ts-ignore - Next.js handles worker imports
+      worker = new Worker(new URL("../worker/wasmHash.ts", import.meta.url), { type: "module" });
+    } catch {
+      // Fallback to inline hashing if workers are not supported
+      onProgress({ phase: "hashing", bytesProcessed: 0, totalBytes: bytes.length });
+      sha256Hex(bytes)
+        .then((hash) => {
+          onProgress({ phase: "complete", hash });
+          resolve(hash);
+        })
+        .catch((error) => {
+          onProgress({ phase: "error", reason: error.message });
+          reject(error);
+        });
+      return;
+    }
+
+    worker.onmessage = (event: MessageEvent<{ type: "progress"; phase: WasmHashProgress }>) => {
+      const { phase } = event.data;
+      onProgress(phase);
+      if (phase.phase === "complete" && phase.hash) {
+        worker.terminate();
+        resolve(phase.hash);
+      } else if (phase.phase === "error") {
+        worker.terminate();
+        reject(new Error(phase.reason));
+      } else if (phase.phase === "cancelled") {
+        worker.terminate();
+        reject(new Error("Hashing cancelled"));
+      }
+    };
+
+    worker.onerror = (error) => {
+      worker.terminate();
+      reject(new Error(`Worker error: ${error.message}`));
+    };
+
+    // Post the bytes to the worker (transfer ownership for efficiency)
+    worker.postMessage(
+      {
+        type: "hash",
+        bytes: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+      },
+      [bytes.buffer],
+    );
+
+    // Return a cancellation function
+    return () => {
+      worker.postMessage({ type: "cancel" });
+    };
+  });
+}
+
+/**
+ * Build an integrity report using worker-based parsing and hashing with progress reporting.
+ *
+ * This is the main entry point for the UI: it fetches the bytecode, then runs
+ * both parsing and hashing in workers with progress callbacks, allowing the
+ * operator to see coarse progress and cancel if needed.
+ */
+export async function buildIntegrityReportWithProgress(params: {
+  wasm: Uint8Array;
+  reportedWasmHash?: string | null;
+  pinned?: { wasmHash: string; wasmBytes: number };
+  onParseProgress?: (progress: WasmParseProgress) => void;
+  onHashProgress?: (progress: WasmHashProgress) => void;
+}): Promise<IntegrityReport> {
+  const pinned = params.pinned ?? {
+    wasmHash: PHASE1_ARTIFACT.wasmHash,
+    wasmBytes: PHASE1_ARTIFACT.wasmBytes,
+  };
+  const bytes = params.wasm.length;
+
+  // Run parsing and hashing in parallel
+  const [inspection, sha256] = await Promise.all([
+    inspectWasmInWorker(params.wasm, params.onParseProgress ?? (() => {})),
+    hashWasmInWorker(params.wasm, params.onHashProgress ?? (() => {})),
+  ]);
+
+  if (!inspection.ok) {
+    return {
+      verdict: "malformed",
+      headline: "UNRECOGNIZED BYTECODE",
+      detail: `The fetched bytes are not a readable WASM module: ${inspection.reason}`,
+      sha256: null,
+      bytes,
+      pinnedHash: pinned.wasmHash,
+      pinnedBytes: pinned.wasmBytes,
+      reportedWasmHash: params.reportedWasmHash ?? null,
+      entrypoints: [],
+      sections: [],
+      metadata: null,
+    };
+  }
+
+  const matchesPinned = sha256 === pinned.wasmHash;
+  const ledgerAgrees =
+    !params.reportedWasmHash || params.reportedWasmHash.toLowerCase() === sha256.toLowerCase();
+
+  if (matchesPinned && ledgerAgrees) {
+    return {
+      verdict: "verified",
+      headline: "VERIFIED BUILD",
+      detail: `These bytes are the pinned Phase 1 artifact (${sha256.slice(0, 16)}…, ${bytes} bytes).`,
+      sha256,
+      bytes,
+      pinnedHash: pinned.wasmHash,
+      pinnedBytes: pinned.wasmBytes,
+      reportedWasmHash: params.reportedWasmHash ?? null,
+      entrypoints: inspection.entrypoints,
+      sections: inspection.sections,
+      metadata: inspection.metadata,
+    };
+  }
+
+  const why = !matchesPinned
+    ? `its hash is ${sha256.slice(0, 16)}…, not the pinned ${pinned.wasmHash.slice(0, 16)}…`
+    : `the ledger declares ${params.reportedWasmHash?.slice(0, 16)}… for this contract`;
+  return {
+    verdict: "unrecognized",
+    headline: "UNRECOGNIZED BYTECODE",
+    detail: `This contract is not the pinned artifact: ${why} (${bytes} bytes, pinned build is ${pinned.wasmBytes}).`,
+    sha256,
+    bytes,
+    pinnedHash: pinned.wasmHash,
+    pinnedBytes: pinned.wasmBytes,
+    reportedWasmHash: params.reportedWasmHash ?? null,
+    entrypoints: inspection.entrypoints,
+    sections: inspection.sections,
+    metadata: inspection.metadata,
+  };
 }

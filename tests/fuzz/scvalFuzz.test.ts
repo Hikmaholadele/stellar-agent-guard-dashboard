@@ -21,6 +21,11 @@
  * SDK's `decodeCheckResult` / `decodeAuthDecision` /
  * `guardEventsFromDiagnostics`. Adding the two named decoders is tracked
  * separately rather than smuggled into a test-only change.
+ *
+ * Extended in #368 to cover:
+ * - Policy JSON import/export (policySchema.ts)
+ * - Asset caps CSV import/export (assetCapsCsv.ts)
+ * - XDR envelope import (submit.ts)
  */
 
 import assert from "node:assert/strict";
@@ -40,6 +45,20 @@ import {
 } from "../../lib/guard/formatters.ts";
 import { EMPTY_DRAFT, buildPolicyConfig, type PolicyDraft } from "../../lib/guard/policyForm.ts";
 import { hexToBytes } from "../../lib/guard/scval.ts";
+import {
+  importPolicyFromJson,
+  exportPolicyDraft,
+  exportPolicyToJson,
+  policyExportSchemaV1,
+} from "../../lib/guard/policySchema.ts";
+import {
+  parseAssetCapsCsv,
+  parseAssetCapsJson,
+  exportAssetCapsCsv,
+  exportAssetCapsJson,
+  validateAssetCapOverrides,
+} from "../../lib/guard/assetCapsCsv.ts";
+import { validateSourcePolicy, planMigration } from "../../lib/guard/migration.ts";
 
 /** The issue requires at least 1,000 iterations per property. */
 const NUM_RUNS = 1_000;
@@ -391,6 +410,299 @@ test("guardEventsFromDiagnostics safely ignores arbitrary event objects", () => 
         }
       },
     ),
+    { numRuns: NUM_RUNS },
+  );
+});
+
+/**
+ * Fuzzing for policy JSON import/export (policySchema.ts).
+ * These inputs cross trust boundaries — an operator can import a policy
+ * file from any source. The import must either succeed with a valid draft
+ * or fail with a structured error, never throw.
+ */
+test("importPolicyFromJson handles arbitrary JSON without throwing", () => {
+  fc.assert(
+    fc.property(fc.anything(), (value) => {
+      const json = JSON.stringify(value);
+      let result;
+      try {
+        result = importPolicyFromJson(json);
+      } catch (error) {
+        assert.ok(error instanceof Error, "importPolicyFromJson must throw Error, not crash");
+        return;
+      }
+      if (result.ok) {
+        assert.ok(result.draft);
+        assert.equal(typeof result.draft.perTxCap, "string");
+        assert.equal(typeof result.draft.windowCap, "string");
+        assert.equal(typeof result.draft.windowSecs, "string");
+        assert.ok(Array.isArray(result.draft.assetCaps));
+      } else {
+        assert.ok(result.issues.length > 0);
+        for (const issue of result.issues) {
+          assert.equal(typeof issue.path, "string");
+          assert.equal(typeof issue.message, "string");
+        }
+      }
+    }),
+    { numRuns: NUM_RUNS },
+  );
+});
+
+test("exportPolicyDraft never throws for arbitrary draft input", () => {
+  fc.assert(
+    fc.property(draftArbitrary, (draft) => {
+      let result;
+      try {
+        result = exportPolicyDraft(draft);
+      } catch (error) {
+        assert.ok(error instanceof Error, "exportPolicyDraft must throw Error, not crash");
+        return;
+      }
+      if (result.ok) {
+        assert.equal(typeof result.json, "string");
+        assert.ok(result.json.trim().startsWith("{"));
+        assert.ok(result.json.trim().endsWith("}"));
+        // Verify it's valid JSON
+        const parsed = JSON.parse(result.json);
+        assert.equal(parsed.version, 1);
+      } else {
+        assert.ok(result.issues.length > 0);
+      }
+    }),
+    { numRuns: NUM_RUNS },
+  );
+});
+
+test("exportPolicyToJson round-trips through importPolicyFromJson for valid configs", () => {
+  fc.assert(
+    fc.property(
+      fc.bigInt({ min: 1n, max: 2n ** 100n }),
+      fc.bigInt({ min: 0n, max: 2n ** 100n }),
+      fc.bigInt({ min: 1n, max: 2n ** 40n }),
+      (perTx, extra, windowSecs) => {
+        const windowCap = perTx + extra;
+        const draft: PolicyDraft = {
+          ...EMPTY_DRAFT,
+          perTxCap: perTx.toString(),
+          windowCap: windowCap.toString(),
+          windowSecs: windowSecs.toString(),
+          assets: CONTRACT,
+          allowAnyRecipient: true,
+        };
+        const exportResult = exportPolicyDraft(draft);
+        if (!exportResult.ok) return;
+        const importResult = importPolicyFromJson(exportResult.json);
+        assert.equal(importResult.ok, true);
+        if (importResult.ok) {
+          assert.equal(importResult.draft.perTxCap, draft.perTxCap);
+          assert.equal(importResult.draft.windowCap, draft.windowCap);
+          assert.equal(importResult.draft.windowSecs, draft.windowSecs);
+        }
+      },
+    ),
+    { numRuns: NUM_RUNS },
+  );
+});
+
+/**
+ * Fuzzing for asset caps CSV/JSON import/export (assetCapsCsv.ts).
+ */
+test("parseAssetCapsCsv handles arbitrary CSV without throwing", () => {
+  fc.assert(
+    fc.property(fc.string({ unit: "binary", maxLength: 512 }), (csv) => {
+      let result;
+      try {
+        result = parseAssetCapsCsv(csv);
+      } catch (error) {
+        assert.ok(error instanceof Error, "parseAssetCapsCsv must throw Error, not crash");
+        return;
+      }
+      assert.ok(Array.isArray(result));
+      for (const row of result) {
+        assert.equal(typeof row.assetContractAddress, "string");
+        assert.equal(typeof row.maxCapStroops, "string");
+        assert.equal(typeof row.symbol, "string");
+      }
+    }),
+    { numRuns: NUM_RUNS },
+  );
+});
+
+test("parseAssetCapsJson handles arbitrary JSON without throwing", () => {
+  fc.assert(
+    fc.property(fc.anything(), (value) => {
+      const json = JSON.stringify(value);
+      let result;
+      try {
+        result = parseAssetCapsJson(json);
+      } catch (error) {
+        assert.ok(error instanceof Error, "parseAssetCapsJson must throw Error, not crash");
+        return;
+      }
+      assert.ok(Array.isArray(result));
+      for (const row of result) {
+        assert.equal(typeof row.assetContractAddress, "string");
+        assert.equal(typeof row.maxCapStroops, "string");
+        assert.equal(typeof row.symbol, "string");
+      }
+    }),
+    { numRuns: NUM_RUNS },
+  );
+});
+
+test("exportAssetCapsCsv and exportAssetCapsJson round-trip", () => {
+  fc.assert(
+    fc.property(
+      fc.array(
+        fc.record({
+          assetContractAddress: fc.constant(CONTRACT),
+          maxCapStroops: fc.bigInt({ min: 1n, max: 2n ** 100n }).map(String),
+          symbol: fc
+            .string({ unit: "grapheme", minLength: 1, maxLength: 12 })
+            .filter((s) => s.trim().length > 0 && s === s.trim()),
+        }),
+        { maxLength: 2 },
+      ),
+      (rows) => {
+        // Filter out duplicate contract addresses (since we only use CONTRACT)
+        const seen = new Set<string>();
+        const uniqueRows = rows.filter((row) => {
+          if (seen.has(row.assetContractAddress)) return false;
+          seen.add(row.assetContractAddress);
+          return true;
+        });
+        if (uniqueRows.length === 0) return;
+        const csv = exportAssetCapsCsv(uniqueRows);
+        const parsedCsv = parseAssetCapsCsv(csv);
+        assert.equal(parsedCsv.length, uniqueRows.length);
+
+        const json = exportAssetCapsJson(uniqueRows);
+        const parsedJson = parseAssetCapsJson(json);
+        assert.equal(parsedJson.length, uniqueRows.length);
+
+        for (let i = 0; i < uniqueRows.length; i++) {
+          const original = uniqueRows[i];
+          const parsedCsvRow = parsedCsv[i];
+          const parsedJsonRow = parsedJson[i];
+          if (!original || !parsedCsvRow || !parsedJsonRow) continue;
+          assert.equal(parsedCsvRow.assetContractAddress, original.assetContractAddress);
+          assert.equal(parsedCsvRow.maxCapStroops, original.maxCapStroops);
+          assert.equal(parsedCsvRow.symbol, original.symbol);
+          assert.equal(parsedJsonRow.assetContractAddress, original.assetContractAddress);
+          assert.equal(parsedJsonRow.maxCapStroops, original.maxCapStroops);
+          assert.equal(parsedJsonRow.symbol, original.symbol);
+        }
+      },
+    ),
+    { numRuns: NUM_RUNS },
+  );
+});
+
+test("validateAssetCapOverrides never throws for arbitrary input", () => {
+  fc.assert(
+    fc.property(
+      fc.array(
+        fc.record({
+          assetContractAddress: fc.string({ unit: "grapheme", maxLength: 64 }),
+          maxCapStroops: fc.string({ unit: "grapheme", maxLength: 64 }),
+          symbol: fc.string({ unit: "grapheme", maxLength: 32 }),
+        }),
+        { maxLength: 5 },
+      ),
+      (rows) => {
+        let result;
+        try {
+          result = validateAssetCapOverrides(rows);
+        } catch (error) {
+          assert.ok(false, "validateAssetCapOverrides must never throw");
+          return;
+        }
+        assert.ok(Array.isArray(result));
+        for (const error of result) {
+          assert.equal(typeof error, "string");
+        }
+      },
+    ),
+    { numRuns: NUM_RUNS },
+  );
+});
+
+/**
+ * Fuzzing for XDR envelope import (SubmitSignedXDRPanel).
+ * The panel imports externally signed transaction envelopes. Malformed
+ * XDR must fail closed without crashing.
+ */
+test("XDR envelope import: Transaction.fromXDR handles arbitrary bytes safely", () => {
+  fc.assert(
+    fc.property(fc.uint8Array({ maxLength: 256 }), (bytes) => {
+      let tx;
+      try {
+        tx = xdr.TransactionEnvelope.fromXDR(bytes);
+      } catch (error) {
+        assert.ok(error instanceof Error);
+        return;
+      }
+      // If it parses, it should be a valid envelope
+      assert.ok(tx);
+      assert.ok("v" in tx || "type" in tx);
+    }),
+    { numRuns: NUM_RUNS },
+  );
+});
+
+/**
+ * Fuzzing for migration path (migration.ts).
+ * A source policy from an untrusted source (exported JSON, explorer dump)
+ * must be validated and either migrate cleanly or report exactly what
+ * fails, without throwing.
+ */
+test("validateSourcePolicy handles arbitrary source objects without throwing", () => {
+  fc.assert(
+    fc.property(fc.anything(), (source) => {
+      let report;
+      try {
+        report = validateSourcePolicy(source);
+      } catch (error) {
+        assert.ok(error instanceof Error, "validateSourcePolicy must throw Error, not crash");
+        return;
+      }
+      assert.equal(typeof report.ok, "boolean");
+      assert.ok(Array.isArray(report.missing));
+      assert.ok(Array.isArray(report.unrecognised));
+      assert.ok(Array.isArray(report.renamed));
+      assert.ok(Array.isArray(report.typeIssues));
+      assert.ok(Array.isArray(report.notes));
+      for (const renamed of report.renamed) {
+        assert.equal(typeof renamed.from, "string");
+        assert.equal(typeof renamed.to, "string");
+      }
+    }),
+    { numRuns: NUM_RUNS },
+  );
+});
+
+test("planMigration handles arbitrary source without throwing", () => {
+  fc.assert(
+    fc.property(fc.anything(), (source) => {
+      let plan;
+      try {
+        plan = planMigration(source);
+      } catch (error) {
+        assert.ok(error instanceof Error, "planMigration must throw Error, not crash");
+        return;
+      }
+      assert.equal(typeof plan.ok, "boolean");
+      if (plan.ok) {
+        assert.ok(plan.draft);
+        assert.ok(Array.isArray(plan.carried));
+        assert.ok(Array.isArray(plan.dropped));
+        assert.equal(typeof plan.summary, "string");
+      } else {
+        assert.equal(typeof plan.message, "string");
+        assert.ok(plan.report);
+      }
+    }),
     { numRuns: NUM_RUNS },
   );
 });
