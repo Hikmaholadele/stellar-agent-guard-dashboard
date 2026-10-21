@@ -293,6 +293,40 @@ describe("deployment verification receipt", () => {
     assert.match(exported?.detail ?? "", /exported/);
   });
 
+  test("redacts secrets and credentials from error diagnostics and failure details", () => {
+    const SECRET_KEY = "SCRUPLHP7D3DLRMTWVZUIVPHFQGSX45IXGG62LDNY2RJ4M24D4CRBYDV";
+    const API_URL = "https://soroban-rpc.testnet.stellar.org?apiKey=supersecretkey123";
+
+    const input = baseInput({
+      steps: [
+        {
+          label: "create_custom_contract",
+          result: {
+            kind: "failed",
+            hash: "abcd",
+            detail: `Failed connecting to ${API_URL} using key ${SECRET_KEY}`,
+            diagnosticEvents: [],
+          },
+        },
+      ],
+      read: {
+        ok: false,
+        error: `Authentication failed at https://user:secretpass@stellar.org for ${SECRET_KEY}`,
+      },
+    });
+
+    const receipt = compileDeploymentReceipt(input);
+    const serialised = formatDeploymentReceipt(receipt);
+
+    assert.ok(!serialised.includes(SECRET_KEY), "secret key must not appear in receipt");
+    assert.ok(
+      !serialised.includes("supersecretkey123"),
+      "api key query must not appear in receipt",
+    );
+    assert.ok(!serialised.includes("secretpass"), "url password must not appear in receipt");
+    assert.ok(serialised.includes("[REDACTED]"), "redacted placeholders must be present");
+  });
+
   test("the serialised document is stable, labelled and parseable", () => {
     const receipt = compileDeploymentReceipt(baseInput());
     const serialised = formatDeploymentReceipt(receipt);

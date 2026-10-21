@@ -5,6 +5,55 @@ import { RetryableRead, ReadSkeleton } from "../../components/bits.tsx";
 import type { ReadResult } from "../../lib/guard/chain.ts";
 import type { ReactElement } from "react";
 import { GuardContext, type SnapshotField } from "../../components/GuardProvider.tsx";
+import {
+  buildReadDiagnostic,
+  redactDiagnosticText,
+  sanitizeEndpointOrigin,
+} from "../../lib/rpc/timeouts.ts";
+
+// ── Safe read diagnostics (#347) ───────────────────────────────────────────
+
+test("a diagnostic carries only the operation, endpoint origin, network and time", () => {
+  const at = new Date("2026-10-21T09:15:00.000Z");
+  const diagnostic = buildReadDiagnostic({
+    operation: "status()",
+    endpoint: "https://soroban-testnet.stellar.org/soroban/rpc?api_key=sk_live_secret#frag",
+    network: "testnet",
+    at,
+  });
+
+  assert.equal(diagnostic.operation, "status()");
+  assert.equal(diagnostic.endpointOrigin, "https://soroban-testnet.stellar.org");
+  assert.equal(diagnostic.network, "testnet");
+  assert.equal(diagnostic.timestamp, "2026-10-21T09:15:00.000Z");
+  assert.match(diagnostic.text, /^operation: status\(\)\nendpoint: https:\/\//);
+  assert.doesNotMatch(diagnostic.text, /api_key|sk_live_secret|#frag/);
+});
+
+test("an endpoint is reduced to its origin, dropping embedded credentials", () => {
+  assert.equal(
+    sanitizeEndpointOrigin("https://ops:hunter2@soroban-testnet.stellar.org/soroban/rpc?token=x"),
+    "https://soroban-testnet.stellar.org",
+  );
+  assert.equal(sanitizeEndpointOrigin("not a url"), "unrecognised-endpoint");
+  assert.equal(sanitizeEndpointOrigin(""), "unrecognised-endpoint");
+});
+
+test("redacts query values, signed XDR and authorization payloads, and secret seeds", () => {
+  const seed = `S${"A".repeat(55)}`;
+  const envelope = `AAAA${"A".repeat(80)}`;
+  const text = redactDiagnosticText(
+    `GET https://rpc.test/soroban/rpc?token=abc&network=testnet failed;` +
+      ` xdr=${envelope}; ${seed}; {"signedXdr":"AAAAdeadbeef","auth":"AAAAcafe"}`,
+  );
+
+  assert.doesNotMatch(text, /token=abc/);
+  assert.match(text, /token=\[redacted\]/);
+  assert.doesNotMatch(text, /network=testnet/);
+  assert.equal(text.includes(envelope), false, "the signed envelope is removed");
+  assert.equal(text.includes(seed), false, "the wallet secret seed is removed");
+  assert.doesNotMatch(text, /AAAAdeadbeef|AAAAcafe/);
+});
 
 installDom();
 

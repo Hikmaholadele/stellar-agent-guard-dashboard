@@ -5,7 +5,7 @@ import { DemoBadge } from "./DemoBadge.tsx";
 import { Tabs } from "./bits.tsx";
 import { AriaAnnouncer } from "./AriaAnnouncer.tsx";
 import { ThemeProvider } from "./ThemeProvider.tsx";
-import { ThemeToggle } from "./ThemeToggle.tsx";
+import { PrivacyToggle, ThemeToggle } from "./ThemeToggle.tsx";
 
 /**
  * Layout shell providing:
@@ -161,10 +161,13 @@ export function LayoutShell({ children }: { children: React.ReactNode }) {
             <nav className="sidebar-content" aria-label="Main navigation">
               <div
                 className="row"
-                style={{ justifyContent: "space-between", marginBottom: "16px" }}
+                style={{ justifyContent: "space-between", marginBottom: "16px", gap: "8px" }}
               >
                 <Tabs />
-                <ThemeToggle />
+                <div className="row" style={{ gap: "8px", alignItems: "center" }}>
+                  <PrivacyToggle />
+                  <ThemeToggle />
+                </div>
               </div>
               {children}
             </nav>
@@ -216,10 +219,13 @@ export function LayoutShell({ children }: { children: React.ReactNode }) {
             <nav className="mobile-drawer-content" aria-label="Mobile navigation">
               <div
                 className="row"
-                style={{ justifyContent: "space-between", marginBottom: "16px" }}
+                style={{ justifyContent: "space-between", marginBottom: "16px", gap: "8px" }}
               >
                 <Tabs />
-                <ThemeToggle />
+                <div className="row" style={{ gap: "8px", alignItems: "center" }}>
+                  <PrivacyToggle />
+                  <ThemeToggle />
+                </div>
               </div>
               {children}
             </nav>

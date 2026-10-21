@@ -352,6 +352,7 @@ function safeJson(value: unknown): string {
  * own `fn_call`/`error`/`log` entries are what make a trap diagnosable.
  */
 export function diagnosticEventsOf(response: unknown): unknown[] {
+  if (!response || typeof response !== "object") return [];
   const candidate = response as {
     diagnosticEventsXdr?: unknown;
     events?: unknown;

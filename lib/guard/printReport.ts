@@ -3,6 +3,7 @@ import { describePolicy, isDeadManFrozen } from "stellar-agent-guard-sdk";
 import type { ReadResult, WasmIdentity } from "./chain.ts";
 import type { InvokeResult } from "./submit.ts";
 import { looksLikeContractAddress } from "./instance.ts";
+import { redactDiagnostics } from "./inputSanitizer.ts";
 
 export interface AuditReport {
   contractId: string;
@@ -181,7 +182,7 @@ function receiptTransaction(label: string, result: InvokeResult): DeploymentRece
         outcome: "failed",
         hash: result.hash,
         ledger: null,
-        detail: result.detail,
+        detail: result.detail ? redactDiagnostics(result.detail) : result.detail,
       };
     case "refused":
       return {
@@ -189,7 +190,7 @@ function receiptTransaction(label: string, result: InvokeResult): DeploymentRece
         outcome: "refused",
         hash: null,
         ledger: null,
-        detail: `${result.stage}: ${result.detail}`,
+        detail: redactDiagnostics(`${result.stage}: ${result.detail}`),
       };
     case "exported":
       return {
@@ -197,7 +198,9 @@ function receiptTransaction(label: string, result: InvokeResult): DeploymentRece
         outcome: "exported",
         hash: null,
         ledger: null,
-        detail: result.detail ?? "an unsigned transaction was exported; nothing was broadcast",
+        detail: redactDiagnostics(
+          result.detail ?? "an unsigned transaction was exported; nothing was broadcast",
+        ),
       };
   }
 }
@@ -281,9 +284,11 @@ export function compileDeploymentReceipt(input: DeploymentReceiptInput): Deploym
         "contract-created",
         "Create transaction",
         "failed",
-        createStep.result.kind === "refused"
-          ? `The create transaction was refused before broadcast (${createStep.result.stage}): ${createStep.result.detail}`
-          : `The create transaction was broadcast and rejected: ${createStep.result.detail}`,
+        redactDiagnostics(
+          createStep.result.kind === "refused"
+            ? `The create transaction was refused before broadcast (${createStep.result.stage}): ${createStep.result.detail}`
+            : `The create transaction was broadcast and rejected: ${createStep.result.detail}`,
+        ),
       ),
     );
   }
@@ -312,7 +317,7 @@ export function compileDeploymentReceipt(input: DeploymentReceiptInput): Deploym
         "live-read",
         "Post-deploy read",
         "failed",
-        `Reading the deployed instance failed: ${input.read.error}`,
+        redactDiagnostics(`Reading the deployed instance failed: ${input.read.error}`),
       ),
     );
   }

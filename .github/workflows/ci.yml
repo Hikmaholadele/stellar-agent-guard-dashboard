@@ -38,6 +38,13 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      # The zero-server boundary is an architectural decision, not a style rule:
+      # a Next.js route handler or a middleware file would be the first place a
+      # proxy, a signer, or a secret could appear. The script names any offending
+      # path and links the ADR, so this fails before review has to notice it.
+      - name: No-server boundary
+        run: npm run check:no-server
+
       # Formatting is a separate gate from linting: eslint-config-next carries
       # no stylistic rules, so prettier is the only thing that can catch
       # whitespace/line-ending drift. It runs before the tests so a format

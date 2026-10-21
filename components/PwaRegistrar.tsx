@@ -32,6 +32,7 @@ import {
   type PwaUpdateView,
 } from "../lib/guard/pwa.ts";
 import { announce } from "../lib/guard/useAnnounce.ts";
+import { OFFLINE_ANNOUNCEMENT, evaluateOffline, useOnlineStatus } from "../lib/guard/online.ts";
 
 export function PwaRegistrar() {
   // The worker that is ready but not active. `null` means no update is waiting.
@@ -46,7 +47,14 @@ export function PwaRegistrar() {
     pwaActivitySnapshot,
     () => IDLE_PWA_ACTIVITY,
   );
+  const online = useOnlineStatus();
   const view = evaluatePwaUpdate({ updateAvailable: waiting !== null, activity });
+
+  // Spoken through the same queue as every other announcement; the visible
+  // notice below is not a second live region.
+  useEffect(() => {
+    if (!online) announce(OFFLINE_ANNOUNCEMENT);
+  }, [online]);
 
   useEffect(() => {
     if (process.env.NODE_ENV !== "production") return;
@@ -143,6 +151,23 @@ export function PwaRegistrar() {
       window.location.reload();
     }, 3000);
   }, [view.deferred, confirming, waiting]);
+
+  // The shell may be served offline before anything else on the page can run,
+  // and this registrar is mounted by the root layout on every route — so this
+  // is where the offline statement belongs. It says what is *not* current, and
+  // it never replaces a value: the panel below keeps showing the last live read
+  // or its own error.
+  if (!online) {
+    const offline = evaluateOffline({ online: false, liveReadFailed: false });
+    return (
+      <div className="pwa-update offline" role="region" aria-label="Connection status">
+        <div className="pwa-update-body">
+          <strong>{offline.title}</strong>
+          <span className="tiny muted">{offline.detail}</span>
+        </div>
+      </div>
+    );
+  }
 
   if (!view.visible || dismissed) return null;
 

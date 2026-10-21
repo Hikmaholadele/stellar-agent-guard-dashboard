@@ -33,6 +33,7 @@ import {
   type VerdictFilter,
 } from "../lib/guard/telemetryExport.ts";
 import { severityFor } from "../lib/guard/feedSeverity.ts";
+import { formatEventTimestamp } from "../lib/guard/time.ts";
 import { decodeUrlState, writeUrlState } from "../lib/guard/urlState.ts";
 import {
   FEED_GUARD_CAP,
@@ -656,6 +657,12 @@ const TelemetryRow = memo(function TelemetryRow({
 }) {
   const severity = severityFor(event);
   const iso = event.ledgerClosedAt ?? event.observedAt ?? null;
+  // Both renderings of the same instant: the local wall time with an explicit
+  // zone label for at-a-glance reading, and the stable UTC value to quote in a
+  // report. The UTC value comes from the parsed instant, so it is unaffected
+  // by this operator's zone or by DST; invalid timestamps yield null and the
+  // cell falls back to the relative time plus `—`.
+  const timestamp = formatEventTimestamp(iso);
   return (
     <tr className={`severity-${severity}`} data-severity={severity} data-stream={event.source}>
       <td>
@@ -692,6 +699,17 @@ const TelemetryRow = memo(function TelemetryRow({
       </td>
       <td className="mono tiny">
         {iso ? <TimeAgo iso={iso} /> : "—"}
+        {timestamp && (
+          <div
+            className="muted"
+            style={{ marginTop: 2 }}
+            title={`${timestamp.local} ${timestamp.zoneLabel} · ${timestamp.utc} UTC`}
+          >
+            {timestamp.local} {timestamp.zoneLabel}
+            <br />
+            {timestamp.utc} UTC
+          </div>
+        )}
         {event.ledger ? (
           <div className="muted" style={{ marginTop: 2 }}>
             L{event.ledger}

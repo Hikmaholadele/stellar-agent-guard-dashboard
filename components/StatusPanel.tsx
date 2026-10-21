@@ -21,6 +21,7 @@ import { StorageExplorerButton } from "./StorageExplorer.tsx";
 import { WebhookAlertBridge } from "./WebhookAlertBridge.tsx";
 import { WebhookSettingsButton } from "./WebhookSettings.tsx";
 import { PHASE1_ARTIFACT, NETWORK } from "../lib/guard/network.ts";
+import { buildReadDiagnostic } from "../lib/rpc/timeouts.ts";
 import { configureHref } from "../lib/guard/deeplink.ts";
 import { NO_POLICY_CONSEQUENCE, policyStateFrom } from "../lib/guard/policyState.ts";
 import { compilePrintReport } from "../lib/guard/printReport.ts";
@@ -41,6 +42,7 @@ import {
 } from "../lib/guard/dmsAlert.ts";
 import { calculateVelocity } from "../lib/guard/velocity.ts";
 import { useStatusTransitionAnnouncer } from "../lib/guard/statusTransitions.ts";
+import { usePrivacy } from "../lib/guard/privacyStore.ts";
 
 /**
  * The proactive dead-man-switch deadline banner, shown above the on-chain
@@ -97,20 +99,37 @@ function DmsAlertBanner({ alert, stale }: { alert: DmsAlert; stale: boolean }) {
 }
 
 /**
- * A ticking local clock, in epoch milliseconds, for read-*age* displays only.
+ * Copyable failure context (issue #347).
  *
- * The same pattern as `TimeAgo`: the render stays pure (state, not a clock
- * read), and the interval only re-renders the components that asked. Nothing
- * derived from this value may ever feed a countdown decision — the ledger
- * clock owns those.
+ * A bare RPC error is hard to report and easy to over-share, so each failed read
+ * contributes a four-line diagnostic — operation, endpoint origin, network and
+ * correlation time — with signed payloads and credentials already removed by
+ * the chain layer. It is a report about a failure, never a stand-in for a value.
  */
-function useNowMs(intervalMs = 5_000): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const id = setInterval(() => setNow(Date.now()), intervalMs);
-    return () => clearInterval(id);
-  }, [intervalMs]);
-  return now;
+function ReadDiagnostics({ entries }: { entries: Array<{ label: string; text: string }> }) {
+  if (entries.length === 0) return null;
+  return (
+    <section className="no-print" aria-label="Read diagnostics" style={{ marginTop: 16 }}>
+      <h3 style={{ marginTop: 0 }}>
+        Diagnostics for the failed {entries.length === 1 ? "read" : "reads"}
+      </h3>
+      <p className="tiny muted">
+        Safe to paste into a report: the operation, endpoint origin, network and correlation time.
+        Signed XDR, authorization payloads and key material are removed.
+      </p>
+      {entries.map((entry) => (
+        <div key={entry.label} style={{ marginTop: 8 }}>
+          <div className="row" style={{ justifyContent: "space-between" }}>
+            <span className="tiny">{entry.label}</span>
+            <CopyButton value={entry.text} label={`${entry.label} diagnostics`} />
+          </div>
+          <pre className="mono tiny" style={{ whiteSpace: "pre-wrap", margin: 0 }}>
+            {entry.text}
+          </pre>
+        </div>
+      ))}
+    </section>
+  );
 }
 
 /**
@@ -169,6 +188,33 @@ export function StatusPanel() {
   // Watermark only: the panel gains the striped training tint while a rehearsal
   // is running. Read from the store as a snapshot, never as a ref.
   const rehearsalActive = useRehearsalActive();
+  const { masked } = usePrivacy();
+
+  // Safe failure context (issue #347). The chain layer attaches a diagnostic to
+  // each failed read; a refresh that never produced a snapshot contributes one
+  // built from the configured endpoint. Nothing here carries chain values, so a
+  // diagnostic can never be mistaken for state.
+  const readDiagnostics: Array<{ label: string; text: string }> = [];
+  if (snapshot) {
+    const results = [
+      ["status()", snapshot.status],
+      ["policy()", snapshot.policy],
+      ["window", snapshot.window],
+      ["wasm identity", snapshot.identity],
+    ] as const;
+    for (const [label, result] of results) {
+      if (!result.ok && result.diagnostic) readDiagnostics.push({ label, text: result.diagnostic });
+    }
+  } else if (snapshotError) {
+    readDiagnostics.push({
+      label: "guard snapshot",
+      text: buildReadDiagnostic({
+        operation: "readSnapshot",
+        endpoint: NETWORK.rpcUrl,
+        network: NETWORK.name,
+      }).text,
+    });
+  }
 
   return (
     <>
@@ -205,7 +251,10 @@ export function StatusPanel() {
         </div>
 
         <p className="tiny muted" style={{ marginTop: 10 }}>
-          <span className="mono">{guard}</span> <CopyButton value={guard} label="guard address" />
+          <span className="mono" aria-label={masked ? "Masked guard address" : undefined}>
+            {masked ? "••••••••••••••••" : guard}
+          </span>{" "}
+          <CopyButton value={guard} label="guard address" />
         </p>
 
         <RehearsalModeToggle />
@@ -292,10 +341,13 @@ export function StatusPanel() {
                     <>
                       <h4 style={{ marginTop: 20 }}>Spending Velocity</h4>
                       <div className="grid">
-                        <Stat label="1m Velocity" value={metrics.spend1m.toString()} />
+                        <Stat
+                          label="1m Velocity"
+                          value={masked ? "••••••" : metrics.spend1m.toString()}
+                        />
                         <Stat
                           label="15m Velocity"
-                          value={metrics.spend15m.toString()}
+                          value={masked ? "••••••" : metrics.spend15m.toString()}
                           tone={isCritical ? "danger" : undefined}
                           note={
                             exhaust !== null
@@ -303,7 +355,10 @@ export function StatusPanel() {
                               : undefined
                           }
                         />
-                        <Stat label="1h Velocity" value={metrics.spend1h.toString()} />
+                        <Stat
+                          label="1h Velocity"
+                          value={masked ? "••••••" : metrics.spend1h.toString()}
+                        />
                       </div>
                       {cap > 0n && (
                         <div style={{ marginTop: 12 }}>
@@ -353,7 +408,7 @@ export function StatusPanel() {
                     <div className="grid">
                       <Stat
                         label="Spent in window"
-                        value={window.total.toString()}
+                        value={masked ? "••••••" : window.total.toString()}
                         note={pct === null ? "no window cap set" : `${pct}% of the ${cap} cap`}
                       />
                       <Stat
@@ -390,14 +445,22 @@ export function StatusPanel() {
                     <div className="grid">
                       <Stat
                         label="Per-transaction cap"
-                        value={policy.per_tx_cap === 0n ? "off" : policy.per_tx_cap.toString()}
+                        value={
+                          masked
+                            ? "••••••"
+                            : policy.per_tx_cap === 0n
+                              ? "off"
+                              : policy.per_tx_cap.toString()
+                        }
                       />
                       <Stat
                         label="Rolling cap"
                         value={
-                          policy.window_cap === 0n
-                            ? "off"
-                            : `${policy.window_cap} / ${policy.window_secs}s`
+                          masked
+                            ? "••••••"
+                            : policy.window_cap === 0n
+                              ? "off"
+                              : `${policy.window_cap} / ${policy.window_secs}s`
                         }
                       />
                       <Stat
@@ -490,6 +553,8 @@ export function StatusPanel() {
             />
           </>
         )}
+
+        <ReadDiagnostics entries={readDiagnostics} />
 
         {printReport && (
           <div className="print-only print-report">

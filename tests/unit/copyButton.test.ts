@@ -317,3 +317,69 @@ test("the pure core: arg capture, rejection shape, and the missing-clipboard fai
     assert.equal(typeof announce, "function");
   });
 });
+
+test("security: CopyButton redacts secret-like values and credentials before clipboard write", async () => {
+  const SECRET_SEED = "SDBQH7YJ7J4WQ7YJ7J4WQ7YJ7J4WQ7YJ7J4WQ7YJ7J4WQ7YJ7J4WQAA";
+  const BASIC_AUTH_URL = "https://admin:supersecretpassword@rpc.testnet.stellar.org";
+  const TOKEN_URL = "https://horizon.stellar.org?apiKey=super_secret_token_12345&foo=bar";
+  const BEARER_TEXT = "Error during submission: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
+
+  const { texts, writer } = capturingWriter();
+
+  await withClipboard(writer, async () => {
+    // 1. Secret seed is redacted
+    const mounted1 = await mountCopyButton(`Failed with key: ${SECRET_SEED}`, "error with secret");
+    try {
+      await act(async () => {
+        mounted1.button.click();
+        await sleep(0);
+      });
+      assert.ok(!texts[0]?.includes(SECRET_SEED), "secret seed must be absent from clipboard");
+      assert.ok(texts[0]?.includes("[REDACTED]"), "secret seed must be replaced with [REDACTED]");
+    } finally {
+      await mounted1.unmount();
+    }
+
+    // 2. URL password is redacted
+    const mounted2 = await mountCopyButton(BASIC_AUTH_URL, "url with auth");
+    try {
+      await act(async () => {
+        mounted2.button.click();
+        await sleep(0);
+      });
+      assert.ok(!texts[1]?.includes("supersecretpassword"), "URL password must be absent");
+      assert.ok(texts[1]?.includes(":[REDACTED]@"), "URL password replaced with [REDACTED]");
+    } finally {
+      await mounted2.unmount();
+    }
+
+    // 3. Query token is redacted
+    const mounted3 = await mountCopyButton(TOKEN_URL, "url with token");
+    try {
+      await act(async () => {
+        mounted3.button.click();
+        await sleep(0);
+      });
+      assert.ok(!texts[2]?.includes("super_secret_token_12345"), "query secret must be absent");
+      assert.ok(texts[2]?.includes("apiKey=[REDACTED]"), "query param replaced with [REDACTED]");
+    } finally {
+      await mounted3.unmount();
+    }
+
+    // 4. Bearer token is redacted
+    const mounted4 = await mountCopyButton(BEARER_TEXT, "bearer header");
+    try {
+      await act(async () => {
+        mounted4.button.click();
+        await sleep(0);
+      });
+      assert.ok(
+        !texts[3]?.includes("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"),
+        "bearer token must be absent",
+      );
+      assert.ok(texts[3]?.includes("Bearer [REDACTED]"), "bearer replaced with [REDACTED]");
+    } finally {
+      await mounted4.unmount();
+    }
+  });
+});

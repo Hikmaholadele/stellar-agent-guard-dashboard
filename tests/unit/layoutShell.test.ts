@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test, before, afterEach, describe } from "node:test";
 import { installDom, loadReact } from "./domHarness.ts";
 import { LayoutShell } from "../../components/LayoutShell.tsx";
+import { privacyStore } from "../../lib/guard/privacyStore.ts";
 
 describe("LayoutShell", () => {
   let dom: ReturnType<typeof installDom>;
@@ -27,6 +28,7 @@ describe("LayoutShell", () => {
     }
     document.body.innerHTML = "";
     localStorage.clear();
+    privacyStore.resetForTesting();
   });
 
   test("renders desktop layout by default (width >= 768px)", async () => {
@@ -354,5 +356,155 @@ describe("LayoutShell", () => {
     // Drawer should be closed when resized to desktop
     assert.notOk(document.querySelector(".mobile-drawer"));
     assert.notOk(document.querySelector(".mobile-backdrop"));
+  });
+
+  test("privacy toggle renders with accessible aria attributes and toggles on click", async () => {
+    Object.defineProperty(window, "innerWidth", {
+      writable: true,
+      configurable: true,
+      value: 1024,
+    });
+
+    const div = document.createElement("div");
+    document.body.appendChild(div);
+    root = createRoot(div);
+
+    await act(() => {
+      root!.render(
+        React.createElement(
+          LayoutShell,
+          null,
+          React.createElement("div", { "data-testid": "content" }, "test content"),
+        ),
+      );
+    });
+
+    const privacyBtn = document.querySelector<HTMLButtonElement>("button.privacy-toggle");
+    assert.ok(privacyBtn, "Privacy toggle button should be rendered in layout shell");
+    assert.equal(privacyBtn.getAttribute("aria-pressed"), "false");
+    assert.equal(privacyBtn.getAttribute("aria-label"), "Enable privacy mask");
+    assert.equal(privacyStore.get(), false);
+
+    // Click toggle to enable
+    await act(async () => {
+      privacyBtn.click();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+
+    assert.equal(privacyStore.get(), true);
+    assert.equal(privacyBtn.getAttribute("aria-pressed"), "true");
+    assert.equal(privacyBtn.getAttribute("aria-label"), "Disable privacy mask");
+
+    // Click toggle again to disable
+    await act(async () => {
+      privacyBtn.click();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+
+    assert.equal(privacyStore.get(), false);
+    assert.equal(privacyBtn.getAttribute("aria-pressed"), "false");
+  });
+
+  test("privacy preference does not persist to localStorage unless explicitly chosen", async () => {
+    Object.defineProperty(window, "innerWidth", {
+      writable: true,
+      configurable: true,
+      value: 1024,
+    });
+
+    const div = document.createElement("div");
+    document.body.appendChild(div);
+    root = createRoot(div);
+
+    await act(() => {
+      root!.render(
+        React.createElement(
+          LayoutShell,
+          null,
+          React.createElement("div", { "data-testid": "content" }, "test content"),
+        ),
+      );
+    });
+
+    const privacyBtn = document.querySelector<HTMLButtonElement>("button.privacy-toggle");
+    assert.ok(privacyBtn);
+
+    // Toggling without explicit persist
+    await act(async () => {
+      privacyBtn.click();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+
+    assert.equal(privacyStore.get(), true);
+    assert.equal(privacyStore.isPersisted(), false);
+    assert.equal(
+      localStorage.getItem("privacy-mask"),
+      null,
+      "should NOT write to localStorage by default",
+    );
+
+    // Setting explicit persist
+    await act(async () => {
+      privacyStore.setPersist(true);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+    assert.equal(
+      localStorage.getItem("privacy-mask"),
+      "true",
+      "should write to localStorage when persist is true",
+    );
+  });
+
+  test("route changes preserve in-memory privacy mask state", async () => {
+    Object.defineProperty(window, "innerWidth", {
+      writable: true,
+      configurable: true,
+      value: 1024,
+    });
+
+    const div = document.createElement("div");
+    document.body.appendChild(div);
+    root = createRoot(div);
+
+    await act(() => {
+      root!.render(
+        React.createElement(
+          LayoutShell,
+          null,
+          React.createElement("div", { "data-testid": "page-1" }, "page 1"),
+        ),
+      );
+    });
+
+    const privacyBtn = document.querySelector<HTMLButtonElement>("button.privacy-toggle");
+    assert.ok(privacyBtn);
+
+    // Turn on privacy
+    await act(async () => {
+      privacyBtn.click();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+    assert.equal(privacyStore.get(), true);
+
+    // Simulate route transition (new children rendered in shell)
+    await act(async () => {
+      root!.render(
+        React.createElement(
+          LayoutShell,
+          null,
+          React.createElement("div", { "data-testid": "page-2" }, "page 2"),
+        ),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+
+    // Mask state remains active after route change
+    assert.equal(
+      privacyStore.get(),
+      true,
+      "privacy mask remains active across simulated route change",
+    );
+    const updatedBtn = document.querySelector<HTMLButtonElement>("button.privacy-toggle");
+    assert.equal(updatedBtn?.getAttribute("aria-pressed"), "true");
   });
 });

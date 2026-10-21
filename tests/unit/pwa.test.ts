@@ -15,6 +15,14 @@ import {
   registerPwaActivity,
   subscribePwaActivity,
 } from "../../lib/guard/pwa.ts";
+import {
+  OFFLINE_SHELL_TITLE,
+  WRITES_UNAVAILABLE_TITLE,
+  evaluateOffline,
+  onlineSnapshot,
+  setOnlineForTest,
+  subscribeOnline,
+} from "../../lib/guard/online.ts";
 
 interface ManifestIcon {
   src: string;
@@ -595,5 +603,89 @@ describe("PWA activity registry", () => {
     again();
     assert.equal(calls, 2);
     assert.equal(pwaActivitySnapshot(), IDLE_PWA_ACTIVITY);
+  });
+});
+
+// ── Cached shell vs live chain data (#348) ─────────────────────────────────
+
+describe("cached shell marker", () => {
+  it("tags an offline navigation as cached, and leaves a live one untagged", async () => {
+    const sw = createServiceWorkerHarness();
+    await sw.install();
+
+    sw.setNetworkDown(true);
+    const offline = await sw.dispatchFetch("/configure", { mode: "navigate" });
+    assert.equal(offline.response?.status, 200);
+    assert.equal(
+      offline.response?.headers.get("X-Guard-Shell"),
+      "cached",
+      "the page can tell the cached shell from a live document",
+    );
+
+    // Reconnect: the same navigation is fetched from the network again and the
+    // marker is gone, so the notice disappears with it.
+    sw.setNetworkDown(false);
+    const online = await sw.dispatchFetch("/", { mode: "navigate" });
+    assert.equal(online.response?.headers.get("X-Guard-Shell"), null);
+  });
+
+  it("tags a stale cached asset, and not a freshly fetched one", async () => {
+    const sw = createServiceWorkerHarness();
+    await sw.install();
+
+    sw.setNetworkDown(true);
+    const stale = await sw.dispatchFetch("/icons/icon.svg");
+    assert.equal(stale.response?.status, 200);
+    assert.equal(stale.response?.headers.get("X-Guard-Shell"), "cached");
+
+    sw.setNetworkDown(false);
+    const fresh = await sw.dispatchFetch("/icons/not-cached.svg");
+    assert.equal(fresh.response?.headers.get("X-Guard-Shell"), null);
+  });
+});
+
+describe("offline decision", () => {
+  it("says nothing when online with successful live reads", () => {
+    const view = evaluateOffline({ online: true, liveReadFailed: false });
+    assert.equal(view.visible, false);
+    assert.equal(view.writesDisabled, false);
+  });
+
+  it("states that an offline shell is not live chain data, and disables writes", () => {
+    const view = evaluateOffline({ online: false, liveReadFailed: false });
+    assert.equal(view.visible, true);
+    assert.equal(view.writesDisabled, true);
+    assert.equal(view.title, OFFLINE_SHELL_TITLE);
+    assert.match(view.detail, /last successful live read/i);
+    assert.match(view.detail, /cached shell/i);
+    assert.match(view.detail, /not current chain state/i);
+  });
+
+  it("disables writes when the required live read failed, even while online", () => {
+    const view = evaluateOffline({ online: true, liveReadFailed: true });
+    assert.equal(view.visible, true);
+    assert.equal(view.writesDisabled, true);
+    assert.equal(view.title, WRITES_UNAVAILABLE_TITLE);
+    assert.match(view.detail, /will not submit blind/i);
+  });
+});
+
+describe("connectivity store", () => {
+  it("reports browser online/offline changes and stops after unsubscribe", () => {
+    let calls = 0;
+    const unsubscribe = subscribeOnline(() => {
+      calls += 1;
+    });
+    try {
+      setOnlineForTest(false);
+      assert.equal(onlineSnapshot(), false);
+      setOnlineForTest(false); // an unchanged value is not a new event
+      assert.equal(calls, 1);
+    } finally {
+      setOnlineForTest(true);
+      unsubscribe();
+    }
+    assert.equal(calls, 2);
+    assert.equal(onlineSnapshot(), true);
   });
 });

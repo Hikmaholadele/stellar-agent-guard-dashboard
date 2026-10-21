@@ -8,6 +8,7 @@ import type { ReadResult } from "../lib/guard/chain.ts";
 import { SKELETON_CLASS } from "../lib/guard/statusReadState.ts";
 import { ENFORCEMENT_SCOPE_STATEMENT } from "../lib/guard/network.ts";
 import { lookupLabel, subscribeAddressBook } from "../lib/guard/addressBook.ts";
+import { usePrivacy } from "../lib/guard/privacyStore.ts";
 import { CopyButton } from "./CopyButton.tsx";
 import {
   formatRawStroops,
@@ -295,10 +296,23 @@ export function AddressText({
   className?: string;
 }): ReactNode {
   const label = useAddressLabel(address);
+  const { masked } = usePrivacy();
   const truncated = label ? short(address, 4, 4) : short(address);
+  const display = masked
+    ? label
+      ? `${label} (••••••••)`
+      : "••••••••"
+    : label
+      ? `${label} (${truncated})`
+      : truncated;
+
   return (
-    <span className={className ?? "mono"} title={address}>
-      {label ? `${label} (${truncated})` : truncated}
+    <span
+      className={className ?? "mono"}
+      title={address}
+      aria-label={masked ? `Masked address${label ? ` for ${label}` : ""}` : undefined}
+    >
+      {display}
     </span>
   );
 }
@@ -403,11 +417,26 @@ export interface AmountDisplayProps extends FormatStroopsOptions {
  */
 export function AmountDisplay({ stroops, symbol, decimals }: AmountDisplayProps) {
   const [showRaw, setShowRaw] = useState(false);
+  const { masked } = usePrivacy();
   const human = formatStroopsWithUnit(stroops, {
     ...(symbol !== undefined ? { symbol } : {}),
     ...(decimals !== undefined ? { decimals } : {}),
   });
   const raw = formatRawStroops(stroops);
+
+  if (masked) {
+    const unit = symbol ?? "XLM";
+    return (
+      <span
+        className="mono"
+        aria-label={`Masked amount in ${unit}`}
+        title="Amount masked for privacy"
+      >
+        {`•••••• ${unit} (masked)`}
+      </span>
+    );
+  }
+
   return (
     <button
       type="button"

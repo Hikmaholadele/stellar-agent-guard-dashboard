@@ -28,8 +28,19 @@ const SKIP_WAITING_MESSAGE = "GUARD_SKIP_WAITING";
 
 // Versioned so activation of a new shell drops the previous one's cached assets
 // instead of mixing two builds in one cache.
-const CACHE_NAME = "stellar-agent-guard-static-v2";
+const CACHE_NAME = "stellar-agent-guard-static-v3";
 const OFFLINE_URL = "/offline.html";
+
+/*
+ * Set on any response the worker answered from its cache (issue #348).
+ *
+ * A cached shell is indistinguishable from a live one by looking at it, which
+ * is exactly the confusion the console must avoid: the page can read this
+ * header on a navigation or asset response and say that it is showing cached
+ * interface, not current chain state. Chain reads never pass through here, so
+ * they never carry the marker.
+ */
+const CACHED_SHELL_HEADER = "X-Guard-Shell";
 
 /** Everything the shell needs to render without the network. */
 const PRECACHE_URLS = [
@@ -77,6 +88,26 @@ function isSameOrigin(url) {
 /** Only a successful, non-opaque response is worth storing. */
 function isCacheable(response) {
   return Boolean(response) && response.status === 200 && (response.type === "basic" || response.type === "default");
+}
+
+/**
+ * A cached response, tagged so the page knows it did not come from the network.
+ *
+ * `Response` headers are immutable, so the body is re-wrapped with a fresh
+ * header set; the status and body are the cached ones, unchanged.
+ */
+function markCached(response) {
+  if (!response) return response;
+  const headers = {};
+  response.headers.forEach((value, key) => {
+    headers[key] = value;
+  });
+  headers[CACHED_SHELL_HEADER] = "cached";
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
 }
 
 self.addEventListener("install", (event) => {
@@ -146,8 +177,9 @@ async function handleStatic(event, request) {
 
   if (cached) {
     // Serve the cached copy now and let the refresh settle in the background.
+    // The tag lets the page say the asset is stale rather than current.
     event.waitUntil(refresh);
-    return cached;
+    return markCached(cached);
   }
   const fresh = await refresh;
   return fresh || Response.error();
@@ -160,11 +192,12 @@ async function handleNavigation(event, request) {
     if (isCacheable(response)) await cache.put(request, response.clone());
     return response;
   } catch {
-    return (
+    const cached =
       (await cache.match(request)) ||
       (await cache.match("/")) ||
-      (await cache.match(OFFLINE_URL)) ||
-      Response.error()
-    );
+      (await cache.match(OFFLINE_URL));
+    // An offline navigation is served the cached shell, tagged so the page can
+    // announce that it is offline interface rather than live chain state.
+    return cached ? markCached(cached) : Response.error();
   }
 }

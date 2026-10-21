@@ -25,6 +25,7 @@ import {
   type NetworkSwitchOutcome,
 } from "../lib/guard/networkSwitch.ts";
 import { OBSERVER_BADGE_LABEL, WRITE_DISABLED_HINT } from "../lib/guard/observerMode.ts";
+import { usePrivacy } from "../lib/guard/privacyStore.ts";
 
 export function WalletBar() {
   const {
@@ -47,6 +48,7 @@ export function WalletBar() {
     switchNetwork,
   } = useGuard();
   const demo = useDemoMode();
+  const { masked } = usePrivacy();
   const [newAddress, setNewAddress] = useState("");
   const [addError, setAddError] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
@@ -96,7 +98,8 @@ export function WalletBar() {
             >
               {instances.map((instance) => (
                 <option key={instance.guard} value={instance.guard}>
-                  {instance.label} — {short(instance.guard, 8, 6)} · {instance.network}
+                  {instance.label} — {masked ? "••••••••" : short(instance.guard, 8, 6)} ·{" "}
+                  {instance.network}
                 </option>
               ))}
             </select>

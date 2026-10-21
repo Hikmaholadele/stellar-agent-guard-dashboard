@@ -96,6 +96,11 @@ $ find . -path ./node_modules -prune -o -name 'middleware.ts' -print | wc -l
 Both are empty, so there is no request handler in this codebase that could sign, hold a key, or proxy
 the RPC. Re-confirming those two greps still return nothing is part of reviewing any change to `app/`.
 
+CI enforces the same boundary mechanically. `npm run check:no-server` fails on any
+`app/**/route.ts(x)` or repository `middleware.ts`, prints the offending paths, and links
+[the zero-server ADR](./docs/adr/001-zero-server-architecture.md), so an API surface cannot be
+introduced without deliberately changing this decision and the review checklist.
+
 ---
 
 ## 4. Read path

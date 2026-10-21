@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { copyToClipboard } from "../lib/guard/clipboard.ts";
 import { announce } from "../lib/guard/useAnnounce.ts";
+import { redactDiagnostics } from "../lib/guard/inputSanitizer.ts";
 
 /**
  * One-click copy for the addresses and hashes operators handle by hand (issue #33).
@@ -61,7 +62,8 @@ export function CopyButton({
   }, []);
 
   async function handleClick() {
-    const result = await copyToClipboard(value);
+    const sanitized = redactDiagnostics(value);
+    const result = await copyToClipboard(sanitized);
     if (revertTimer.current !== null) clearTimeout(revertTimer.current);
     if (result.ok) {
       setError(null);

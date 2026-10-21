@@ -20,6 +20,7 @@
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test tests/unit/*.test.ts tests/fuzz/*.test.ts",
     "test:docs": "node scripts/check-doc-links.mjs",
+    "check:no-server": "node scripts/check-no-server.mjs",
     "changelog": "node scripts/generate-changelog.mjs",
     "sandbox": "bash scripts/start-local-sandbox.sh",
     "test:visual": "playwright test --config=playwright.visual.config.ts",
