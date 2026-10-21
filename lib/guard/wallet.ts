@@ -80,6 +80,23 @@ export async function currentAddress(): Promise<string | null> {
   return (result as { address?: string }).address ?? null;
 }
 
+/**
+ * The wallet's current connection without prompting for access, or null when it
+ * has not granted any.
+ *
+ * The network is *read* rather than assumed, for the same reason
+ * `connectWallet` reads it: a wallet on a different network cannot authorize a
+ * call on this one. Adopting the dashboard's network here instead would let a
+ * mismatched wallet quietly enable writes after a navigation, which is the
+ * exact failure this pairing exists to prevent.
+ */
+export async function currentWallet(): Promise<ConnectedWallet | null> {
+  const address = await currentAddress();
+  if (!address) return null;
+  const network = await getNetworkPassphrase();
+  return { address, networkPassphrase: network.passphrase, network: network.network };
+}
+
 async function getNetworkPassphrase(): Promise<{ network: string; passphrase: string }> {
   const details = await import("@stellar/freighter-api").then((api) => api.getNetworkDetails());
   assertNoError(details, "getNetworkDetails");
