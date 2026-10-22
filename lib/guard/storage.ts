@@ -1,5 +1,17 @@
 import { scValToNative, xdr } from "@stellar/stellar-sdk";
 import { hashToHex, jsonWithBigints, toHex } from "./scval.ts";
+import { ADDRESS_BOOK_STORAGE_KEY } from "./addressBook.ts";
+import { ALERT_SETTINGS_STORAGE_KEY } from "./audioAlert.ts";
+import { DENSITY_STORAGE_KEY } from "./densityStore.ts";
+import { SCOPED_STORAGE_PREFIX } from "./guardScoped.ts";
+import { INSTANCE_STORAGE_PREFIX, LEGACY_INSTANCE_STORAGE_KEY } from "./instance.ts";
+import { LAYOUT_STORAGE_KEY } from "./layoutStore.ts";
+import { SIDEBAR_COLLAPSED_STORAGE_KEY, THEME_STORAGE_KEY } from "./presentationStorageKeys.ts";
+import { PRIVACY_MASK_STORAGE_KEY } from "./privacyStore.ts";
+import { SETUP_STORAGE_KEY } from "./setupChecklist.ts";
+import { clearTxHistory, loadTxHistory, type StorageLike } from "./txHistory.ts";
+import { IDLE_TIMEOUT_STORAGE_KEY } from "./useIdleTimer.ts";
+import { PREFERRED_WALLET_STORAGE_KEY } from "./walletConnector.ts";
 
 /**
  * Decoding what the guard contract has actually stored on the ledger.
@@ -559,4 +571,188 @@ export function summarizeEntries(entries: readonly StorageEntryView[]): string {
   ];
   if (expiring > 0) parts.push(`${expiring} at or past its expiration warning`);
   return parts.join(" · ");
+}
+
+// ---------------------------------------------------------------------------
+// Browser-local operator data controls (issue #332)
+// ---------------------------------------------------------------------------
+
+export type OperatorStorageCategory = "history" | "address-book" | "layouts" | "guard-registry";
+
+export interface OperatorStorageCategoryInfo {
+  id: OperatorStorageCategory;
+  name: string;
+  description: string;
+  itemCount: number;
+}
+
+export const LAYOUT_STORAGE_KEYS: readonly string[] = [
+  LAYOUT_STORAGE_KEY,
+  THEME_STORAGE_KEY,
+  DENSITY_STORAGE_KEY,
+  SIDEBAR_COLLAPSED_STORAGE_KEY,
+  PRIVACY_MASK_STORAGE_KEY,
+  IDLE_TIMEOUT_STORAGE_KEY,
+  ALERT_SETTINGS_STORAGE_KEY,
+  SETUP_STORAGE_KEY,
+  PREFERRED_WALLET_STORAGE_KEY,
+];
+
+function getAllStorageKeys(storage: StorageLike): string[] {
+  if (typeof (storage as any).length === "number" && typeof (storage as any).key === "function") {
+    const keys: string[] = [];
+    for (let i = 0; i < (storage as any).length; i++) {
+      const k = (storage as any).key(i);
+      if (k) keys.push(k);
+    }
+    return keys;
+  }
+  if ((storage as any).data instanceof Map) {
+    return Array.from(((storage as any).data as Map<string, string>).keys());
+  }
+  return Object.keys(storage);
+}
+
+export function getOperatorStorageCategories(
+  storage?: StorageLike | null,
+): OperatorStorageCategoryInfo[] {
+  const store =
+    storage === undefined ? (typeof window !== "undefined" ? window.localStorage : null) : storage;
+
+  let historyCount = 0;
+  if (store) {
+    try {
+      historyCount = loadTxHistory(store).length;
+    } catch {
+      historyCount = 0;
+    }
+  }
+
+  let addressBookCount = 0;
+  if (store) {
+    try {
+      const raw = store.getItem(ADDRESS_BOOK_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) addressBookCount = parsed.length;
+        else if (parsed && Array.isArray((parsed as any).contacts))
+          addressBookCount = (parsed as any).contacts.length;
+      }
+    } catch {
+      addressBookCount = 0;
+    }
+  }
+
+  let layoutsCount = 0;
+  if (store) {
+    for (const key of LAYOUT_STORAGE_KEYS) {
+      if (store.getItem(key) !== null) {
+        layoutsCount += 1;
+      }
+    }
+  }
+
+  let guardRegistryCount = 0;
+  if (store) {
+    try {
+      const keys = getAllStorageKeys(store);
+      for (const key of keys) {
+        if (
+          key.startsWith(INSTANCE_STORAGE_PREFIX) ||
+          key === LEGACY_INSTANCE_STORAGE_KEY ||
+          key.startsWith(SCOPED_STORAGE_PREFIX)
+        ) {
+          const raw = store.getItem(key);
+          if (raw) {
+            try {
+              const parsed = JSON.parse(raw);
+              if (Array.isArray(parsed)) guardRegistryCount += parsed.length;
+              else guardRegistryCount += 1;
+            } catch {
+              guardRegistryCount += 1;
+            }
+          }
+        }
+      }
+    } catch {
+      guardRegistryCount = 0;
+    }
+  }
+
+  return [
+    {
+      id: "history",
+      name: "Transaction History",
+      description: "Transaction hashes, operations, outcomes, and fees recorded by this browser.",
+      itemCount: historyCount,
+    },
+    {
+      id: "address-book",
+      name: "Address Book",
+      description: "Contact nicknames and public Stellar addresses saved locally.",
+      itemCount: addressBookCount,
+    },
+    {
+      id: "layouts",
+      name: "Layouts & UI Preferences",
+      description: "Dashboard panel layout order, theme, density, and display preferences.",
+      itemCount: layoutsCount,
+    },
+    {
+      id: "guard-registry",
+      name: "Guard Registry",
+      description: "Saved public guard addresses, nicknames, and per-guard operational drafts.",
+      itemCount: guardRegistryCount,
+    },
+  ];
+}
+
+export function clearOperatorStorageCategory(
+  category: OperatorStorageCategory,
+  storage?: StorageLike | null,
+): void {
+  const store =
+    storage === undefined ? (typeof window !== "undefined" ? window.localStorage : null) : storage;
+  if (!store) return;
+
+  const removeKey = (key: string) => {
+    if (typeof store.removeItem === "function") {
+      store.removeItem(key);
+    } else {
+      store.setItem(key, "");
+      if ((store as any).data instanceof Map) {
+        ((store as any).data as Map<string, string>).delete(key);
+      }
+    }
+  };
+
+  switch (category) {
+    case "history":
+      clearTxHistory(store);
+      break;
+
+    case "address-book":
+      removeKey(ADDRESS_BOOK_STORAGE_KEY);
+      break;
+
+    case "layouts":
+      for (const key of LAYOUT_STORAGE_KEYS) {
+        removeKey(key);
+      }
+      break;
+
+    case "guard-registry": {
+      const keys = getAllStorageKeys(store);
+      for (const key of keys) {
+        if (
+          key.startsWith(INSTANCE_STORAGE_PREFIX) ||
+          key === LEGACY_INSTANCE_STORAGE_KEY ||
+          key.startsWith(SCOPED_STORAGE_PREFIX)
+        ) {
+          removeKey(key);
+        }
+      }
+      break;
+    }
+  }
 }

@@ -71,6 +71,13 @@ export interface WalletConnector {
   connect(): Promise<WalletConnection>;
   getPublicKey(): Promise<string>;
   getNetwork(): Promise<WalletNetwork>;
+  /**
+   * Re-read the active address *without* prompting, or null when the provider
+   * is gone. Optional because a web wallet's only address read opens its
+   * pop-up; a connector without it simply has no live binding check, rather
+   * than reporting every write as a disconnect.
+   */
+  currentAddress?(): Promise<string | null>;
   signTransaction(transactionXdr: string, options?: SignOptions): Promise<string>;
   signAuthEntry(authEntryXdr: string, options?: SignOptions): Promise<string>;
 }
@@ -466,6 +473,13 @@ export function createFreighterConnector(
       assertFreighterOk(result, "read the account address");
       return requireAddress(result.address, id);
     },
+    async currentAddress() {
+      // `getAddress` is silent after access was granted — no new prompt.
+      const freighter = await api();
+      const result = await freighter.getAddress();
+      assertFreighterOk(result, "read the account address");
+      return result.address ?? null;
+    },
     async getNetwork() {
       const freighter = await api();
       const details = await freighter.getNetworkDetails();
@@ -556,6 +570,19 @@ export function createXbullConnector(provider: XbullProvider | null): WalletConn
         throw mapConnectorError(error, id, "read the wallet network");
       }
     },
+    // Only when the extension exposes a silent read; `connect()` would prompt,
+    // which a write boundary must never do.
+    ...(wallet.getPublicKey
+      ? {
+          async currentAddress(): Promise<string | null> {
+            try {
+              return (await wallet.getPublicKey!()) ?? null;
+            } catch {
+              return null;
+            }
+          },
+        }
+      : {}),
     async signTransaction(transactionXdr, options) {
       try {
         const signed = await wallet.signTransaction(transactionXdr, { ...(options ?? {}) });
@@ -722,11 +749,26 @@ export function connectorSigner(
   networkPassphrase: string = NETWORK.passphrase,
 ): {
   address: string;
+  /** Present only when the provider has a silent live-address read. */
+  currentAddress?: () => Promise<string | null>;
   signTransaction(transactionXdr: string): Promise<string>;
   signAuthEntry(entryXdr: string): Promise<string>;
 } {
   return {
     address,
+    ...(connector.currentAddress
+      ? {
+          // A reader that throws means the provider is gone; submit.ts maps that
+          // to a phase-specific, recoverable interruption.
+          currentAddress: async (): Promise<string | null> => {
+            try {
+              return await connector.currentAddress!();
+            } catch {
+              return null;
+            }
+          },
+        }
+      : {}),
     async signTransaction(transactionXdr: string): Promise<string> {
       try {
         return await connector.signTransaction(transactionXdr, { networkPassphrase, address });

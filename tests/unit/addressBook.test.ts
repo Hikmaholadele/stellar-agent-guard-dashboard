@@ -141,6 +141,16 @@ test("entries with an invalid address or blank label are dropped on load", () =>
   assert.equal(loaded[0]?.label, "good");
 });
 
+test("a partial legacy address book stays untouched for recovery", () => {
+  const raw = JSON.stringify([
+    { address: ACCOUNT, label: "good" },
+    { address: "bad", label: "unreadable" },
+  ]);
+  const storage = memoryStorage({ [ADDRESS_BOOK_STORAGE_KEY]: raw });
+  assert.equal(loadAddressBook(storage).length, 1);
+  assert.equal(storage.dump()[ADDRESS_BOOK_STORAGE_KEY], raw);
+});
+
 /* -------------------------------------------------------------------------- */
 /* Versioned export                                                           */
 /* -------------------------------------------------------------------------- */

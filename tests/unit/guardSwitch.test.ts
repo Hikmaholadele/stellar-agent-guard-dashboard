@@ -295,11 +295,9 @@ test("deleting a saved guard clears the state scoped to it and keeps other guard
     );
     const persisted = JSON.parse(
       window.localStorage.getItem(instanceStorageKey("testnet")) ?? "[]",
-    ) as Array<{
-      guard: string;
-    }>;
+    ) as { data?: Array<{ guard: string }> };
     assert.equal(
-      persisted.some((entry) => entry.guard === SAVED),
+      persisted.data?.some((entry) => entry.guard === SAVED),
       false,
       "removed from the saved list",
     );

@@ -201,6 +201,17 @@ describe("rename and delete", () => {
 });
 
 describe("v1 → v2 migration", () => {
+  it("leaves a partially malformed legacy list unchanged for recovery", () => {
+    const raw = JSON.stringify([
+      { guard: ADDED, label: "Legacy" },
+      { guard: "not-an-address", label: "Malformed" },
+    ]);
+    const storage = memoryStorage({ [LEGACY_INSTANCE_STORAGE_KEY]: raw });
+    loadInstances({ storage });
+    assert.equal(storage.dump()[LEGACY_INSTANCE_STORAGE_KEY], raw);
+    assert.equal(storage.dump()[instanceStorageKey("testnet")], undefined);
+  });
+
   it("adopts legacy entries into the current network and removes the old key", () => {
     const storage = memoryStorage({
       [LEGACY_INSTANCE_STORAGE_KEY]: JSON.stringify([{ guard: ADDED, label: "Legacy" }]),

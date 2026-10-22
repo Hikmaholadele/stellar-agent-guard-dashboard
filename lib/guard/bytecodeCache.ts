@@ -5,7 +5,7 @@ export interface CacheEntry {
   expiresAt: number;
 }
 
-const STORAGE_KEY = "stellar_bytecode_hash_cache";
+export const BYTECODE_CACHE_STORAGE_KEY = "stellar_bytecode_hash_cache";
 const MAX_ENTRIES = 50;
 const TTL_MS = 60 * 60 * 1000;
 
@@ -14,7 +14,7 @@ const memoryStore: Record<string, CacheEntry> = {};
 function getStore(): Record<string, CacheEntry> {
   if (typeof sessionStorage === "undefined") return memoryStore;
   try {
-    const raw = sessionStorage.getItem(STORAGE_KEY);
+    const raw = sessionStorage.getItem(BYTECODE_CACHE_STORAGE_KEY);
     return raw ? JSON.parse(raw) : {};
   } catch {
     return {};
@@ -24,7 +24,7 @@ function getStore(): Record<string, CacheEntry> {
 function setStore(store: Record<string, CacheEntry>) {
   if (typeof sessionStorage === "undefined") return;
   try {
-    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+    sessionStorage.setItem(BYTECODE_CACHE_STORAGE_KEY, JSON.stringify(store));
   } catch {}
 }
 

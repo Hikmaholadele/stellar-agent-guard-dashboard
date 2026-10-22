@@ -211,13 +211,13 @@ test("a verified freeze is announced into a region that outlives the dialog", as
       null,
       "the dialog is gone by the time the write is announced",
     );
-    const trigger = Array.from(mounted.container.querySelectorAll("button")).find(
-      (candidate) => candidate.textContent?.trim() === "Freeze this account",
+    const unfreeze = Array.from(mounted.container.querySelectorAll("button")).find(
+      (candidate) => candidate.textContent?.trim() === "Unfreeze",
     );
     assert.equal(
       document.activeElement,
-      trigger,
-      "focus is already back on the trigger the announcement is about",
+      unfreeze,
+      "focus moves to the available action when the confirmed freeze disables its trigger",
     );
     assert.equal(
       mounted.container.querySelector('[aria-live="polite"]'),

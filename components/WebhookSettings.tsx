@@ -184,8 +184,11 @@ export function WebhookSettingsModal({ onClose }: { onClose: () => void }) {
             </span>
           ) : (
             <span className="hint">
-              Plain http is accepted only on localhost. Slack and Discord incoming-webhook URLs work
-              as-is.
+              Use https:// (plain http only on localhost) and no username, password or{" "}
+              <span className="mono">@</span> in the host. The POST leaves this browser directly for
+              the URL you enter, so whether the destination accepts it is governed by the remote
+              service and its own CORS policy and how it treats the request — this dashboard cannot
+              proxy, restrict or verify it. Slack and Discord incoming-webhook URLs work as-is.
             </span>
           )}
         </label>

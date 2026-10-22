@@ -8,6 +8,7 @@ import {
   evaluateApprovalState,
   pendingSigners,
   remainingWeightSummary,
+  signerRuleChanges,
   type MultisigSigner,
   type MultisigThresholds,
 } from "../../lib/guard/multisig.ts";
@@ -24,6 +25,8 @@ import { Account, Keypair, Networks, Operation, TransactionBuilder } from "@stel
 const ADMIN_1 = "GC7CKKC2QRWJ3DPVNJKGJSDIQLT2WCY5V2G2SWJADAVDWDKYZB4BQKQV";
 const ADMIN_2 = "GAXGJECHBVKN2SXTBWKTWAK5DABQ7AX7VACXZYPV5XJDNG5XLLH5JHOG";
 const ADMIN_3 = "GDJ6UXKHZ2KRXPLLTSDA3AUWZJSHVRLW4XTWCH7KGD5DJHQNSDSVDOIT";
+const VALID_ADMIN_1 = Keypair.random().publicKey();
+const VALID_ADMIN_2 = Keypair.random().publicKey();
 const THRESHOLDS: MultisigThresholds = { low_threshold: 0, med_threshold: 20, high_threshold: 30 };
 
 function signers(): MultisigSigner[] {
@@ -232,8 +235,8 @@ test("default signer labels are stable and one-based", () => {
 test("readAccountSigners maps Horizon's record into tracker inputs and reports failures", async () => {
   const record = {
     signers: [
-      { key: ADMIN_1, weight: 10, type: "ed25519_public_key" },
-      { key: ADMIN_2, weight: 10, type: "ed25519_public_key" },
+      { key: VALID_ADMIN_1, weight: 10, type: "ed25519_public_key" },
+      { key: VALID_ADMIN_2, weight: 10, type: "ed25519_public_key" },
       {
         key: "TBUQNML5TT5ZNFKXVLSGDWSYS3IWLTDKNS3RR5RQDR3VBQZ7ACLULG2F",
         weight: 5,
@@ -256,7 +259,9 @@ test("readAccountSigners maps Horizon's record into tracker inputs and reports f
   assert.equal(ok.value.signers[0]?.label, "Signer 1");
   assert.equal(ok.value.signers[0]?.kind, "ed25519");
   assert.equal(ok.value.signers[2]?.kind, "hash");
-  assert.equal(ok.value.thresholds.med_threshold, 20);
+  assert.equal(ok.value.thresholds?.med_threshold, 20);
+  assert.ok(Number.isFinite(Date.parse(ok.value.observedAt)));
+  assert.deepEqual(ok.value.incompleteReasons, []);
 
   const failing = {
     accounts: () => ({
@@ -270,6 +275,49 @@ test("readAccountSigners maps Horizon's record into tracker inputs and reports f
   const failed = await readAccountSignersForTest(failing, ADMIN_1);
   assert.equal(failed.ok, false);
   if (!failed.ok) assert.match(failed.error, /404/);
+});
+
+test("a partial Horizon record is distinct from a complete signer read", async () => {
+  const partialServer = {
+    accounts: () => ({
+      accountId: () => ({
+        call: async () => ({
+          signers: [
+            { key: VALID_ADMIN_1, weight: 10, type: "ed25519_public_key" },
+            { key: VALID_ADMIN_2, type: "ed25519_public_key" },
+          ],
+          thresholds: { low_threshold: 0, med_threshold: 20 },
+        }),
+      }),
+    }),
+  } as unknown as Horizon.Server;
+  const result = await readAccountSignersForTest(partialServer, ADMIN_1);
+  assert.ok(result.ok);
+  assert.equal(result.value.signers.length, 1);
+  assert.equal(result.value.thresholds, null);
+  assert.match(result.value.incompleteReasons.join(" "), /incomplete signer data/);
+  assert.match(result.value.incompleteReasons.join(" "), /all valid account thresholds/);
+});
+
+test("invalid thresholds or duplicate signer records stay incomplete", () => {
+  const invalidThresholds = evaluateApprovalState({
+    signers: signers(),
+    thresholds: { low_threshold: 0, med_threshold: 300, high_threshold: 30 },
+    signatures: signers().map((signer) => ({ signer: signer.key })),
+  });
+  assert.equal(invalidThresholds.evaluationStatus, "incomplete");
+  assert.equal(invalidThresholds.ready, false);
+  assert.equal(invalidThresholds.requiredWeight, null);
+
+  const duplicateSigner = signers()[0]!;
+  const duplicateRecords = evaluateApprovalState({
+    signers: [duplicateSigner, { ...duplicateSigner, weight: 20 }],
+    thresholds: THRESHOLDS,
+    signatures: [{ signer: duplicateSigner.key }],
+  });
+  assert.equal(duplicateRecords.evaluationStatus, "incomplete");
+  assert.equal(duplicateRecords.ready, false);
+  assert.match(duplicateRecords.evaluationReasons.join(" "), /duplicate signer keys/);
 });
 
 test("remaining weight is calculated separately for every threshold", () => {
@@ -344,7 +392,7 @@ test("duplicate signatures are counted once and reported", () => {
   assert.deepEqual(state.duplicateSignatures, [ADMIN_1]);
 });
 
-test("unsupported signer data downgrades remaining weight to unknown, never to zero", () => {
+test("unsupported signer data cannot produce a ready or met threshold", () => {
   const state = evaluateApprovalState({
     signers: [
       { key: ADMIN_1, weight: 10, label: "Admin 1", kind: "ed25519" },
@@ -358,18 +406,22 @@ test("unsupported signer data downgrades remaining weight to unknown, never to z
     thresholds: THRESHOLDS,
     signatures: [{ signer: ADMIN_1 }],
   });
+  assert.equal(state.evaluationStatus, "unsupported");
+  assert.equal(state.ready, false);
   assert.equal(state.coverage, "unknown");
   assert.equal(state.remainingWeight, null, "a lower bound is not a definite shortfall");
   assert.equal(state.thresholds[1]?.remainingWeight, null);
-  assert.equal(state.thresholds[0]?.remainingWeight, 0, "a met threshold is still known to be met");
+  assert.equal(state.thresholds[0]?.remainingWeight, null);
+  assert.equal(
+    state.thresholds.some((threshold) => threshold.met),
+    false,
+  );
   assert.equal(state.unattributableSigners.length, 1);
   assert.equal(state.unattributableSigners[0]?.label, "Hash signer");
-  assert.equal(
-    remainingWeightSummary(state),
-    "Remaining weight at the medium threshold is unknown: 1 signer of a type that cannot be matched from envelope signatures.",
-  );
+  assert.match(remainingWeightSummary(state), /Threshold status is unsupported/);
 
-  // Even an incomplete read can prove the envelope is already over the line.
+  // A lower bound above the threshold is still not a verdict when the account
+  // includes signers whose contributions cannot be identified.
   const alreadyMet = evaluateApprovalState({
     signers: [
       { key: ADMIN_1, weight: 10, label: "Admin 1", kind: "ed25519" },
@@ -383,8 +435,10 @@ test("unsupported signer data downgrades remaining weight to unknown, never to z
     thresholds: { low_threshold: 0, med_threshold: 10, high_threshold: 30 },
     signatures: [{ signer: ADMIN_1 }],
   });
-  assert.equal(alreadyMet.ready, true);
-  assert.equal(alreadyMet.remainingWeight, 0);
+  assert.equal(alreadyMet.evaluationStatus, "unsupported");
+  assert.equal(alreadyMet.ready, false);
+  assert.equal(alreadyMet.thresholds[1]?.met, false);
+  assert.equal(alreadyMet.remainingWeight, null);
 });
 
 test("ambiguous signature matching is reported as unknown coverage", () => {
@@ -394,9 +448,37 @@ test("ambiguous signature matching is reported as unknown coverage", () => {
     signatures: [{ signer: ADMIN_1 }],
     signatureDataComplete: false,
   });
+  assert.equal(state.evaluationStatus, "incomplete");
+  assert.equal(state.ready, false);
   assert.equal(state.coverage, "unknown");
   assert.equal(state.remainingWeight, null);
-  assert.match(remainingWeightSummary(state), /could not be matched unambiguously/);
+  assert.match(remainingWeightSummary(state), /do not uniquely identify/);
+});
+
+test("refreshing account rules reports signer and threshold changes and recalculates readiness", () => {
+  const previous = evaluateApprovalState({
+    signers: signers(),
+    thresholds: THRESHOLDS,
+    signatures: [{ signer: ADMIN_1 }, { signer: ADMIN_2 }],
+  });
+  assert.equal(previous.ready, true);
+
+  const current = evaluateApprovalState({
+    signers: [
+      { key: ADMIN_2, weight: 5, label: "Signer 2" },
+      { key: ADMIN_3, weight: 10, label: "Signer 3" },
+    ],
+    thresholds: { low_threshold: 0, med_threshold: 25, high_threshold: 30 },
+    signatures: [{ signer: ADMIN_1 }, { signer: ADMIN_2 }],
+  });
+  assert.equal(current.ready, false);
+  assert.equal(current.collectedWeight, 5);
+  assert.equal(current.requiredWeight, 25);
+
+  const changes = signerRuleChanges(previous, current);
+  assert.ok(changes.some((change) => change.includes("Admin 1") && change.includes("removed")));
+  assert.ok(changes.some((change) => change.includes("weight changed from 10 to 5")));
+  assert.ok(changes.some((change) => change.includes("Medium threshold changed from 20 to 25")));
 });
 
 test("the remaining-weight summary never renders an unknown value as zero", () => {
@@ -436,7 +518,15 @@ async function readAccountSignersForTest(
   server: Horizon.Server,
   accountId: string,
 ): Promise<
-  | { ok: true; value: { signers: MultisigSigner[]; thresholds: MultisigThresholds } }
+  | {
+      ok: true;
+      value: {
+        signers: MultisigSigner[];
+        thresholds: MultisigThresholds | null;
+        observedAt: string;
+        incompleteReasons: string[];
+      };
+    }
   | { ok: false; error: string }
 > {
   const mod = await import("../../lib/guard/multisigRead.ts");

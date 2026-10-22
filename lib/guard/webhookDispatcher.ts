@@ -164,6 +164,13 @@ function defaultStorage(): StorageLike | null {
  * clear text because an operator mistyped the scheme. `localhost` is exempt
  * because the common first target — a receiver on the operator's own machine —
  * is not going to have a certificate.
+ *
+ * Credentials are rejected before the scheme is even considered. A `user:pass@`
+ * — or a bare `@` — in the authority is not somewhere a webhook belongs: the
+ * browser would send those bytes as HTTP basic auth to whoever really owns the
+ * host, and an `@` lets the text before it masquerade as the destination the
+ * operator meant. A host that will not parse is likewise refused; it would
+ * otherwise resolve to an endpoint nobody chose.
  */
 export function validateWebhookUrl(url: string): string | null {
   const trimmed = url.trim();
@@ -174,12 +181,28 @@ export function validateWebhookUrl(url: string): string | null {
   } catch {
     return "That is not a URL. It needs to start with https://.";
   }
+  // `URL` moves any non-empty userinfo into `username`/`password`, which catches
+  // `user@`, `:pass@` and `user:pass@`. It does *not* flag the empty-credential
+  // `https://@host`, whose username is `""` — so the authority itself is scanned
+  // for the `@` delimiter too. That scan is scoped to the authority (the bytes
+  // between `//` and the first `/`, `?` or `#`), so a legitimate `@` in a path
+  // segment (`/hooks/@team`) still validates.
+  if (parsed.username !== "" || parsed.password !== "" || authorityHasCredentials(trimmed)) {
+    return "Remove the username, password, or `@` from the host. A webhook URL must not carry credentials.";
+  }
   if (parsed.protocol === "https:") return null;
   if (parsed.protocol === "http:" && isLoopbackHost(parsed.hostname)) return null;
   if (parsed.protocol === "http:") {
     return "Use https:// for a webhook URL. Plain http is only allowed on localhost.";
   }
   return `Unsupported scheme "${parsed.protocol}". Webhooks must be https://.`;
+}
+
+/** Does the URL's authority contain an `@`, marking userinfo (even empty)? */
+function authorityHasCredentials(raw: string): boolean {
+  // scheme://[userinfo@]host[:port][/path?query#fragment]
+  const authority = /^[^:/?#]+:\/\/([^/?#]*)/.exec(raw)?.[1] ?? "";
+  return authority.includes("@");
 }
 
 function isLoopbackHost(hostname: string): boolean {

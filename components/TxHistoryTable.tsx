@@ -12,10 +12,13 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   TX_HISTORY_LIMIT,
+  TX_HISTORY_MAX_AGE_DAYS,
+  clearTxHistory,
   filterTxHistory,
   loadTxHistory,
   paginateTxHistory,
   subscribeTxHistory,
+  txHistorySaveWarning,
   txHistoryMatchesNetwork,
   txHistoryToCsv,
   txVerificationStatus,
@@ -44,11 +47,16 @@ export function TxHistoryTable() {
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
   const [page, setPage] = useState(1);
+  const [saveWarning, setSaveWarning] = useState<string | null>(null);
+  const [confirmClear, setConfirmClear] = useState(false);
 
   // Read the store only in the browser, and follow later records (another
   // panel submitting, another tab) through the store's subscription.
   useEffect(() => {
-    const sync = () => setEntries(loadTxHistory());
+    const sync = () => {
+      setEntries(loadTxHistory());
+      setSaveWarning(txHistorySaveWarning());
+    };
     sync();
     return subscribeTxHistory(sync);
   }, []);
@@ -60,18 +68,19 @@ export function TxHistoryTable() {
   const paged = paginateTxHistory(filtered, page, PAGE_SIZE);
 
   async function verifyEntry(entry: TxHistoryEntry) {
-    if (!txHistoryMatchesNetwork(entry, NETWORK.passphrase)) return;
+    if (!entry.hash || !txHistoryMatchesNetwork(entry, NETWORK.passphrase)) return;
+    const hash = entry.hash;
     setVerifications((current) => ({
       ...current,
-      [entry.hash]: { status: "checking", verifiedAt: null },
+      [hash]: { status: "checking", verifiedAt: null },
     }));
     try {
-      const result = await server.getTransaction(entry.hash);
+      const result = await server.getTransaction(hash);
       const status = txVerificationStatus(String(result.status));
       const nextStatus = status ?? "unavailable";
       setVerifications((current) => ({
         ...current,
-        [entry.hash]: {
+        [hash]: {
           status: nextStatus,
           verifiedAt: new Date().toISOString(),
           ...(status === null
@@ -80,19 +89,19 @@ export function TxHistoryTable() {
         },
       }));
       announce(
-        `Transaction ${entry.hash.slice(0, 8)} verification: ${verificationLabel(nextStatus)} on ${entry.networkName}`,
+        `Transaction ${hash.slice(0, 8)} verification: ${verificationLabel(nextStatus)} on ${entry.networkName}`,
       );
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       setVerifications((current) => ({
         ...current,
-        [entry.hash]: {
+        [hash]: {
           status: "unavailable",
           verifiedAt: new Date().toISOString(),
           detail,
         },
       }));
-      announce(`Transaction ${entry.hash.slice(0, 8)} verification unavailable: ${detail}`);
+      announce(`Transaction ${hash.slice(0, 8)} verification unavailable: ${detail}`);
     }
   }
 
@@ -110,20 +119,75 @@ export function TxHistoryTable() {
     announce(`Exported ${filtered.length} transaction${filtered.length === 1 ? "" : "s"} as CSV`);
   }
 
+  function downloadHistoryBackup() {
+    const csv = txHistoryToCsv(entries);
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `guard-tx-history-backup-${new Date().toISOString().slice(0, 10)}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
   return (
     <div className="panel">
       <div className="row" style={{ justifyContent: "space-between" }}>
         <h2 style={{ margin: 0 }}>Transaction history</h2>
         <span className="tiny muted">
-          {entries.length} of {TX_HISTORY_LIMIT} entries kept in this browser
+          {entries.length} of {TX_HISTORY_LIMIT} entries kept in this browser (max{" "}
+          {TX_HISTORY_MAX_AGE_DAYS} days retention)
         </span>
       </div>
 
       <p className="tiny muted" style={{ marginTop: 8 }}>
         Every admin transaction signed from this console — policy changes, freezes, unfreezes,
         deployments — recorded with the hash the network accepted. Refused calls never became
-        transactions, so they have no place here.
+        transactions, and cancellations are tracked without a transaction hash.
       </p>
+
+      {saveWarning !== null && (
+        <div role="alert" className="tiny" data-testid="history-save-warning">
+          {saveWarning}
+          <button type="button" className="secondary" onClick={downloadHistoryBackup}>
+            Download history backup
+          </button>
+        </div>
+      )}
+
+      {confirmClear && (
+        <div
+          role="alert"
+          className="notice danger"
+          style={{ marginTop: 12 }}
+          data-testid="clear-history-confirm"
+        >
+          <p style={{ margin: 0 }}>
+            <strong>Clear browser-local transaction history?</strong>
+          </p>
+          <p className="tiny" style={{ margin: "4px 0 8px 0" }}>
+            Clearing local records removes transaction history stored in this browser only. On-chain
+            transactions and ledger state are completely unchanged.
+          </p>
+          <div className="row" style={{ gap: 8 }}>
+            <button
+              type="button"
+              className="danger"
+              onClick={() => {
+                clearTxHistory();
+                setConfirmClear(false);
+                announce("Local transaction history cleared. On-chain transactions are unchanged.");
+              }}
+              data-testid="confirm-clear-history-button"
+            >
+              Confirm Clear
+            </button>
+            <button type="button" className="secondary" onClick={() => setConfirmClear(false)}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
 
       <div className="split" style={{ marginTop: 12 }}>
         <label className="field" style={{ marginBottom: 0 }}>
@@ -162,6 +226,16 @@ export function TxHistoryTable() {
           >
             Export CSV
           </button>
+          <button
+            type="button"
+            className="secondary danger"
+            onClick={() => setConfirmClear(true)}
+            disabled={entries.length === 0}
+            style={{ alignSelf: "flex-end" }}
+            data-testid="clear-history-button"
+          >
+            Clear local history
+          </button>
         </div>
       </div>
 
@@ -176,78 +250,110 @@ export function TxHistoryTable() {
         </p>
       ) : (
         <>
-          <div className="scrolly" style={{ marginTop: 14 }}>
-            <table className="events">
+          <div className="scrolly table-stack" style={{ marginTop: 14 }}>
+            <table className="events stack">
               <thead>
                 <tr>
-                  <th>Timestamp</th>
-                  <th>Operation</th>
-                  <th>Status</th>
-                  <th>Network</th>
-                  <th>Tx Hash</th>
-                  <th>Gas Fee</th>
-                  <th>Chain verification</th>
+                  <th scope="col">Timestamp</th>
+                  <th scope="col">Operation</th>
+                  <th scope="col">Status</th>
+                  <th scope="col">Network</th>
+                  <th scope="col">Tx Hash</th>
+                  <th scope="col">Gas Fee</th>
+                  <th scope="col">Chain verification</th>
                 </tr>
               </thead>
               <tbody>
-                {paged.rows.map((entry) => (
-                  <tr key={entry.hash}>
-                    <td className="mono tiny" title={entry.recordedAt}>
-                      {formatTimestamp(entry.recordedAt)}
-                    </td>
-                    <td className="mono tiny">{entry.operation}</td>
-                    <td>
-                      {entry.status === "confirmed" ? (
-                        <span className="pill ok">Confirmed</span>
-                      ) : (
-                        <span className="pill danger">Failed</span>
-                      )}
-                    </td>
-                    <td className="tiny" title={entry.networkPassphrase ?? "Network not recorded"}>
-                      <div>{entry.networkName ?? "Unknown network"}</div>
-                      <div className="muted">{entry.networkPassphrase ?? "Legacy history"}</div>
-                    </td>
-                    <td>
-                      <TxHashCell hash={entry.hash} />
-                    </td>
-                    <td className="mono tiny">
-                      {entry.feeStroops !== null ? `${entry.feeStroops} stroops` : "—"}
-                    </td>
-                    <td className="tiny">
-                      {txHistoryMatchesNetwork(entry, NETWORK.passphrase) ? (
-                        <button
-                          type="button"
-                          className="secondary"
-                          onClick={() => void verifyEntry(entry)}
-                          disabled={verifications[entry.hash]?.status === "checking"}
-                          aria-label={`Verify transaction ${entry.hash} on ${entry.networkName ?? "recorded network"}`}
-                        >
-                          {verifications[entry.hash]?.status === "checking"
-                            ? "Checking…"
-                            : "Verify"}
-                        </button>
-                      ) : (
-                        <span title="Verification is limited to the exact recorded network passphrase">
-                          Unavailable
-                        </span>
-                      )}
-                      {verifications[entry.hash] && (
-                        <div style={{ marginTop: 4 }}>
-                          <div>Chain: {verificationLabel(verifications[entry.hash]!.status)}</div>
-                          {verifications[entry.hash]!.detail && (
-                            <div className="muted">{verifications[entry.hash]!.detail}</div>
-                          )}
-                          {verifications[entry.hash]!.verifiedAt && (
-                            <div className="muted">
-                              Checked {formatTimestamp(verifications[entry.hash]!.verifiedAt!)} via{" "}
-                              {NETWORK.rpcUrl}
-                            </div>
-                          )}
-                        </div>
-                      )}
-                    </td>
-                  </tr>
-                ))}
+                {paged.rows.map((entry) => {
+                  const hash = entry.hash;
+                  const verification = hash ? verifications[hash] : undefined;
+                  return (
+                    <tr key={hash ?? entry.id ?? entry.recordedAt}>
+                      <td className="mono tiny" data-label="Timestamp" title={entry.recordedAt}>
+                        {formatTimestamp(entry.recordedAt)}
+                      </td>
+                      <td className="mono tiny" data-label="Operation">
+                        {entry.operation}
+                      </td>
+                      <td data-label="Status">
+                        {entry.status === "confirmed" ? (
+                          <span className="pill ok">Confirmed</span>
+                        ) : entry.status === "submitted" ? (
+                          <span className="pill info">Submitted</span>
+                        ) : entry.status === "cancelled" ? (
+                          <span className="pill warn">Cancelled</span>
+                        ) : entry.status === "pre-submit-failure" ? (
+                          <span className="pill danger">Pre-submit failure</span>
+                        ) : (
+                          <span className="pill danger">Failed</span>
+                        )}
+                      </td>
+                      <td
+                        className="tiny"
+                        data-label="Network"
+                        title={entry.networkPassphrase ?? "Network not recorded"}
+                      >
+                        <div>{entry.networkName ?? "Unknown network"}</div>
+                        <div className="muted">{entry.networkPassphrase ?? "Legacy history"}</div>
+                      </td>
+                      <td data-label="Tx Hash">
+                        {hash ? (
+                          <TxHashCell hash={hash} />
+                        ) : (
+                          <span
+                            className="muted tiny mono"
+                            title={entry.detail ?? "Transaction not broadcast"}
+                          >
+                            — (not broadcast)
+                          </span>
+                        )}
+                      </td>
+                      <td className="mono tiny" data-label="Gas Fee">
+                        {entry.feeStroops !== null ? `${entry.feeStroops} stroops` : "—"}
+                      </td>
+                      <td className="tiny" data-label="Chain verification">
+                        {!hash ||
+                        entry.status === "cancelled" ||
+                        entry.status === "pre-submit-failure" ? (
+                          <span
+                            className="muted"
+                            title="Transaction was not broadcast to the network"
+                          >
+                            Not broadcast
+                          </span>
+                        ) : txHistoryMatchesNetwork(entry, NETWORK.passphrase) ? (
+                          <button
+                            type="button"
+                            className="secondary"
+                            onClick={() => void verifyEntry(entry)}
+                            disabled={verification?.status === "checking"}
+                            aria-label={`Verify transaction ${hash} on ${entry.networkName ?? "recorded network"}`}
+                          >
+                            {verification?.status === "checking" ? "Checking…" : "Verify"}
+                          </button>
+                        ) : (
+                          <span title="Verification is limited to the exact recorded network passphrase">
+                            Unavailable
+                          </span>
+                        )}
+                        {verification && (
+                          <div style={{ marginTop: 4 }}>
+                            <div>Chain: {verificationLabel(verification.status)}</div>
+                            {verification.detail && (
+                              <div className="muted">{verification.detail}</div>
+                            )}
+                            {verification.verifiedAt && (
+                              <div className="muted">
+                                Checked {formatTimestamp(verification.verifiedAt)} via{" "}
+                                {NETWORK.rpcUrl}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

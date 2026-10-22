@@ -27,6 +27,8 @@ import {
   evaluateApprovalState,
   pendingSigners,
   remainingWeightSummary,
+  signerRuleChanges,
+  type EnvelopeSignature,
   type MultisigApprovalState,
 } from "../lib/guard/multisig.ts";
 import {
@@ -44,9 +46,24 @@ interface TrackerReport {
   /** The envelope's hash, as the network would compute it. */
   hash: string | null;
   envelopeXdr: string;
+  sourceAccount: string;
+  envelopeSignatures: EnvelopeSignature[];
   state: MultisigApprovalState;
   /** Signatures on the envelope that no current account signer claims. */
   unmatched: string[];
+  /** Timestamp of the latest live Horizon signer and threshold read. */
+  signerReadAt: string | null;
+  signerReadError: string | null;
+  signerRuleChanges: string[];
+}
+
+function makeIncompleteState(reason: string): MultisigApprovalState {
+  return evaluateApprovalState({
+    signers: [],
+    thresholds: null,
+    signatures: [],
+    incompleteReasons: [reason],
+  });
 }
 
 async function copyText(text: string): Promise<boolean> {
@@ -76,6 +93,43 @@ export function MultisigTracker() {
   const [report, setReport] = useState<TrackerReport | null>(null);
   const [copied, setCopied] = useState<"hash" | "xdr" | null>(null);
 
+  async function evaluateEnvelope(params: {
+    hash: string | null;
+    envelopeXdr: string;
+    sourceAccount: string;
+    envelopeSignatures: EnvelopeSignature[];
+  }): Promise<TrackerReport> {
+    const account = await readAccountSigners(createHorizonServer(), params.sourceAccount);
+    if (!account.ok) {
+      const signerReadError = `Could not read current signers and thresholds: ${account.error}`;
+      return {
+        ...params,
+        state: makeIncompleteState(signerReadError),
+        unmatched: [],
+        signerReadAt: null,
+        signerReadError,
+        signerRuleChanges: [],
+      };
+    }
+
+    const matched = matchEnvelopeSignatures(params.envelopeSignatures, account.value.signers);
+    const state = evaluateApprovalState({
+      signers: account.value.signers,
+      thresholds: account.value.thresholds,
+      signatures: matched.signatures,
+      signatureDataComplete: matched.ambiguousHints.length === 0,
+      incompleteReasons: account.value.incompleteReasons,
+    });
+    return {
+      ...params,
+      state,
+      unmatched: unmatchedSignatures(params.envelopeSignatures, account.value.signers),
+      signerReadAt: account.value.observedAt,
+      signerReadError: null,
+      signerRuleChanges: [],
+    };
+  }
+
   const analyse = useCallback(async () => {
     setBusy(true);
     setError(null);
@@ -95,41 +149,22 @@ export function MultisigTracker() {
       const hash = toHex(envelope.hash());
       const sourceAccount = (envelope as unknown as { source: string }).source;
 
-      const server = createHorizonServer();
-      const account = await readAccountSigners(server, sourceAccount);
-      if (!account.ok) {
-        setError(
-          `Could not read the signers and thresholds of ${sourceAccount} from Horizon: ${account.error}`,
-        );
-        return;
-      }
-
       const signatures = readEnvelopeSignatures(trimmed);
       if (!signatures.ok) {
         setError(`Could not decode signatures from the envelope: ${signatures.error}`);
         return;
       }
-
-      // Translate hint-carried envelope signatures into the signer identities
-      // the tracker compares, by matching each hint against the account's
-      // signers (see `multisigRead.ts` for why only hints are available).
-      // Ambiguous hints are reported so the arithmetic can say "unknown"
-      // instead of attributing weight to the wrong key.
-      const matched = matchEnvelopeSignatures(signatures.value, account.value.signers);
-
-      const state = evaluateApprovalState({
-        signers: account.value.signers,
-        thresholds: account.value.thresholds,
-        signatures: matched.signatures,
-        signatureDataComplete: matched.ambiguousHints.length === 0,
+      const nextReport = await evaluateEnvelope({
+        hash,
+        envelopeXdr: trimmed,
+        sourceAccount,
+        envelopeSignatures: signatures.value,
       });
-      const unmatched = unmatchedSignatures(signatures.value, account.value.signers);
-
-      setReport({ hash, envelopeXdr: trimmed, state, unmatched });
+      setReport(nextReport);
       announce(
-        state.ready
+        nextReport.state.ready
           ? "Multisig envelope has enough signatures to submit"
-          : `Multisig envelope pending: ${state.collectedWeight} of ${state.requiredWeight} weight collected. ${remainingWeightSummary(state)}`,
+          : `Multisig approval status: ${nextReport.state.evaluationStatus}. ${approvalSummary(nextReport.state)}`,
       );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -137,6 +172,22 @@ export function MultisigTracker() {
       setBusy(false);
     }
   }, [xdr]);
+
+  const refreshSignerRules = async () => {
+    if (!report) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const refreshed = await evaluateEnvelope(report);
+      if (report.signerReadAt !== null && refreshed.signerReadAt !== null) {
+        refreshed.signerRuleChanges = signerRuleChanges(report.state, refreshed.state);
+      }
+      setReport(refreshed);
+      announce(`Signer and threshold rules refreshed. ${approvalSummary(refreshed.state)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const doCopy = async (kind: "hash" | "xdr") => {
     if (!report) return;
@@ -173,6 +224,13 @@ export function MultisigTracker() {
         <button onClick={() => void analyse()} disabled={busy || xdr.trim().length === 0}>
           {busy ? "Reading account…" : "Check approvals"}
         </button>
+        <button
+          className="secondary"
+          onClick={() => void refreshSignerRules()}
+          disabled={busy || !report}
+        >
+          {busy && report ? "Refreshing rules…" : "Refresh signer rules"}
+        </button>
       </div>
 
       {error && <ErrorBlock title="The envelope could not be tracked" detail={error} />}
@@ -180,32 +238,76 @@ export function MultisigTracker() {
       {report && (
         <>
           <div className="notice info" style={{ marginTop: 10 }}>
-            <strong>{report.state.ready ? "Ready to submit" : "Pending co-signatures"}</strong>
+            <strong>
+              {report.state.evaluationStatus === "supported"
+                ? report.state.ready
+                  ? "Threshold met"
+                  : "Pending co-signatures"
+                : report.state.evaluationStatus === "unsupported"
+                  ? "Unsupported signer configuration"
+                  : "Incomplete signer data"}
+            </strong>
             <span className="tiny">{approvalSummary(report.state)}</span>
-            <div
-              role="progressbar"
-              aria-valuenow={approvalPercent(report.state)}
-              aria-valuemin={0}
-              aria-valuemax={100}
-              aria-label="Collected signature weight"
-              style={{
-                marginTop: 8,
-                height: 8,
-                borderRadius: 999,
-                background: "var(--panel-2)",
-                border: "1px solid var(--line)",
-                overflow: "hidden",
-              }}
-            >
+            {report.state.evaluationStatus === "supported" && (
               <div
+                role="progressbar"
+                aria-valuenow={approvalPercent(report.state)}
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-label="Collected signature weight"
                 style={{
-                  width: `${approvalPercent(report.state)}%`,
-                  height: "100%",
-                  background: report.state.ready ? "var(--ok)" : "var(--accent)",
+                  marginTop: 8,
+                  height: 8,
+                  borderRadius: 999,
+                  background: "var(--panel-2)",
+                  border: "1px solid var(--line)",
+                  overflow: "hidden",
                 }}
-              />
-            </div>
+              >
+                <div
+                  style={{
+                    width: `${approvalPercent(report.state)}%`,
+                    height: "100%",
+                    background: report.state.ready ? "var(--ok)" : "var(--accent)",
+                  }}
+                />
+              </div>
+            )}
           </div>
+
+          <div className="notice" style={{ marginTop: 10 }}>
+            <strong>Data sources</strong>
+            <span className="tiny">
+              Envelope signatures: parsed locally from the pasted XDR (
+              {report.envelopeSignatures.length} signature(s)); not a chain read.
+            </span>
+            <span className="tiny">
+              Current signer weights and thresholds:{" "}
+              {report.signerReadAt
+                ? `Horizon read at ${new Date(report.signerReadAt).toLocaleString()}.`
+                : "unavailable."}
+            </span>
+            {report.signerReadError && <span className="tiny">{report.signerReadError}</span>}
+            {report.state.evaluationReasons.map((reason) => (
+              <span className="tiny" key={reason}>
+                {reason}
+              </span>
+            ))}
+          </div>
+
+          {report.signerRuleChanges.length > 0 && (
+            <div className="notice" role="status" style={{ marginTop: 10 }}>
+              <strong>Signer rules changed since the previous live read</strong>
+              {report.signerRuleChanges.map((change) => (
+                <span className="tiny" key={change}>
+                  {change}
+                </span>
+              ))}
+              <span className="tiny muted">
+                Approval was recalculated using the latest signer weights and thresholds.
+              </span>
+            </div>
+          )}
 
           {report.hash && (
             <div className="row" style={{ marginTop: 10 }}>
@@ -228,25 +330,30 @@ export function MultisigTracker() {
               {report.state.thresholds.map((threshold) => (
                 <li key={threshold.level}>
                   {THRESHOLD_LABELS[threshold.level]} ({threshold.requiredWeight}):{" "}
-                  {threshold.remainingWeight === null
-                    ? "unknown — signer data could not be fully matched"
-                    : threshold.remainingWeight === 0
-                      ? "met"
-                      : `${threshold.remainingWeight} more weight required`}{" "}
+                  {report.state.evaluationStatus !== "supported" ||
+                  threshold.requiredWeight === null
+                    ? "not evaluated"
+                    : threshold.remainingWeight === null
+                      ? "unknown"
+                      : threshold.remainingWeight === 0
+                        ? "met"
+                        : `${threshold.remainingWeight} more weight required`}{" "}
                   <span className="muted">
-                    (collected {threshold.collectedWeight} of {threshold.requiredWeight})
+                    (collected {threshold.collectedWeight}; required{" "}
+                    {threshold.requiredWeight ?? "unknown"})
                   </span>
                 </li>
               ))}
             </ul>
-            {report.state.coverage === "unknown" && (
-              <span className="tiny muted">
-                This account has signers whose signatures cannot be identified from an envelope
-                (hash, pre-auth, signed-payload or ambiguous-hint signers). Their signatures still
-                count on the network, so the remaining weight is a lower bound, not an exact figure.
-                Re-check after those co-signers report back.
-              </span>
-            )}
+            {report.state.evaluationStatus === "supported" &&
+              report.state.coverage === "unknown" && (
+                <span className="tiny muted">
+                  This account has signers whose signatures cannot be identified from an envelope
+                  (hash, pre-auth, signed-payload or ambiguous-hint signers). Their signatures still
+                  count on the network, so the remaining weight is a lower bound, not an exact
+                  figure. Re-check after those co-signers report back.
+                </span>
+              )}
           </div>
 
           {report.state.duplicateSignatures.length > 0 && (
@@ -263,8 +370,9 @@ export function MultisigTracker() {
           )}
 
           <p className="tiny muted" style={{ marginTop: 8 }}>
-            Pass the hash and envelope to the remaining co-signers — each reviews and signs the same
-            envelope, and only then can it be submitted.
+            {report.state.evaluationStatus === "supported"
+              ? "Pass the hash and envelope to the remaining co-signers — each reviews and signs the same envelope, and only then can it be submitted."
+              : "The dashboard cannot determine whether the current signature set meets account rules. Inspect the account configuration and rely on the network response for final validation."}
           </p>
 
           {report.unmatched.length > 0 && (
@@ -273,9 +381,9 @@ export function MultisigTracker() {
                 {report.unmatched.length} signature(s) match no current account signer
               </strong>
               <span className="tiny">
-                The envelope carries signatures whose hint does not match any signer Horizon lists
-                for the source account. The network would not count them either; they may be from
-                removed signers.
+                These signature hints do not match a listed Ed25519 signer. They may belong to an
+                unsupported signer kind or a removed signer; only the network can determine whether
+                the envelope is valid.
               </span>
             </div>
           )}

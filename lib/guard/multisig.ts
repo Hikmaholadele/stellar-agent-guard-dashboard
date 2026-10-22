@@ -64,6 +64,7 @@ export interface MultisigThresholds {
 
 /** The threshold levels an account carries. Admin writes use the medium one. */
 export type ThresholdLevel = "low" | "med" | "high";
+export type MultisigEvaluationStatus = "supported" | "unsupported" | "incomplete";
 
 /** A signature present on a pending envelope. */
 export interface EnvelopeSignature {
@@ -80,7 +81,7 @@ export interface EnvelopeSignature {
 export interface ThresholdProgress {
   level: ThresholdLevel;
   /** Weight this level requires. */
-  requiredWeight: number;
+  requiredWeight: number | null;
   /** Weight the envelope has collected (an identical number at every level). */
   collectedWeight: number;
   /**
@@ -101,10 +102,14 @@ export interface ThresholdProgress {
  * multisig transaction — so no failure semantics attach to it.
  */
 export interface MultisigApprovalState {
+  /** Whether the dashboard can evaluate this account configuration safely. */
+  evaluationStatus: MultisigEvaluationStatus;
+  /** Specific configuration or envelope input that prevents evaluation. */
+  evaluationReasons: string[];
   /** Total weight of the signatures actually on the envelope. */
   collectedWeight: number;
   /** The threshold this transaction must meet (see `thresholdLevel`). */
-  requiredWeight: number;
+  requiredWeight: number | null;
   /** `true` only when `collectedWeight >= requiredWeight`. */
   ready: boolean;
   /** Per-signer status, in the account's signer order. */
@@ -159,6 +164,13 @@ function isEd25519(signer: MultisigSigner): boolean {
   return signer.kind === undefined || signer.kind === "ed25519";
 }
 
+function validThresholds(thresholds: MultisigThresholds | null): thresholds is MultisigThresholds {
+  if (thresholds === null) return false;
+  return [thresholds.low_threshold, thresholds.med_threshold, thresholds.high_threshold].every(
+    (value) => Number.isInteger(value) && value >= 0 && value <= 255,
+  );
+}
+
 /**
  * Evaluate a pending envelope against the account's signers and thresholds.
  *
@@ -179,12 +191,11 @@ function isEd25519(signer: MultisigSigner): boolean {
  *    account alone suffices.
  *  - Non-Ed25519 signers with weight cannot be matched from the envelope's
  *    4-byte signature hints. As soon as one exists (or the caller reports
- *    ambiguous hint matching), the remaining weight is `null` unless the
- *    collected lower bound already meets the threshold.
+ *    ambiguous hint matching), no threshold is declared met.
  */
 export function evaluateApprovalState(params: {
   signers: readonly MultisigSigner[];
-  thresholds: MultisigThresholds;
+  thresholds: MultisigThresholds | null;
   signatures: readonly EnvelopeSignature[];
   /** Which threshold governs. Admin writes are medium-threshold operations. */
   thresholdLevel?: ThresholdLevel;
@@ -194,6 +205,8 @@ export function evaluateApprovalState(params: {
    * Defaults to `true`; a caller that knows matching was ambiguous must say so.
    */
   signatureDataComplete?: boolean;
+  /** Additional account-read incompleteness reported by the reader. */
+  incompleteReasons?: readonly string[];
 }): MultisigApprovalState {
   const { signers: accountSigners, thresholds, signatures } = params;
   const level = params.thresholdLevel ?? "med";
@@ -221,37 +234,78 @@ export function evaluateApprovalState(params: {
   }
 
   const unattributable = accountSigners.filter((signer) => signer.weight > 0 && !isEd25519(signer));
-  const coverage =
-    (params.signatureDataComplete ?? true) && unattributable.length === 0 ? "complete" : "unknown";
+  const incompleteReasons = [...(params.incompleteReasons ?? [])];
+  if (
+    accountSigners.some(
+      (signer) =>
+        typeof signer.key !== "string" ||
+        signer.key.length === 0 ||
+        !Number.isInteger(signer.weight) ||
+        signer.weight < 0 ||
+        signer.weight > 255,
+    )
+  ) {
+    incompleteReasons.push("One or more signer keys or weights are invalid.");
+  }
+  if (new Set(accountSigners.map((signer) => signer.key)).size !== accountSigners.length) {
+    incompleteReasons.push("The account signer list contains duplicate signer keys.");
+  }
+  if (!(params.signatureDataComplete ?? true)) {
+    incompleteReasons.push(
+      "Envelope signature hints do not uniquely identify the account signers.",
+    );
+  }
+  if (!validThresholds(thresholds)) {
+    incompleteReasons.push("One or more account thresholds are missing or invalid.");
+  }
+  const evaluationStatus: MultisigEvaluationStatus =
+    unattributable.length > 0
+      ? "unsupported"
+      : incompleteReasons.length > 0
+        ? "incomplete"
+        : "supported";
+  const evaluationReasons = [
+    ...unattributable.map(
+      (signer) =>
+        `${signer.label} uses ${signer.kind ?? "a non-Ed25519 signer"}, which cannot be evaluated from transaction signature hints.`,
+    ),
+    ...incompleteReasons,
+  ];
+  const coverage = evaluationStatus === "supported" ? "complete" : "unknown";
 
   const remainingFor = (requiredWeight: number): number | null => {
+    if (evaluationStatus !== "supported") return null;
     const missing = Math.max(0, requiredWeight - collectedWeight);
-    if (missing === 0) return 0;
-    return coverage === "complete" ? missing : null;
+    return missing;
   };
 
   const thresholdProgress = (["low", "med", "high"] as const).map((thresholdLevel) => {
-    const requiredWeight =
-      thresholdLevel === "low"
+    const requiredWeight = validThresholds(thresholds)
+      ? thresholdLevel === "low"
         ? thresholds.low_threshold
         : thresholdLevel === "high"
           ? thresholds.high_threshold
-          : thresholds.med_threshold;
+          : thresholds.med_threshold
+      : null;
     return {
       level: thresholdLevel,
       requiredWeight,
       collectedWeight,
-      remainingWeight: remainingFor(requiredWeight),
-      met: collectedWeight >= requiredWeight,
+      remainingWeight: requiredWeight === null ? null : remainingFor(requiredWeight),
+      met:
+        evaluationStatus === "supported" &&
+        requiredWeight !== null &&
+        collectedWeight >= requiredWeight,
     };
   }) as [ThresholdProgress, ThresholdProgress, ThresholdProgress];
 
-  const requiredWeight =
-    level === "low"
+  const requiredWeight = validThresholds(thresholds)
+    ? level === "low"
       ? thresholds.low_threshold
       : level === "high"
         ? thresholds.high_threshold
-        : thresholds.med_threshold;
+        : thresholds.med_threshold
+    : null;
 
   // Build statuses only after the total is known, so every pending signer sees
   // the same shortfall rather than the partial total accumulated so far.
@@ -266,12 +320,18 @@ export function evaluateApprovalState(params: {
     if (signed && signer.weight > 0) {
       return { ...base, status: "signed", weightNeeded: null };
     }
-    const shortfall = Math.max(0, requiredWeight - collectedWeight);
+    const shortfall =
+      requiredWeight === null ? null : Math.max(0, requiredWeight - collectedWeight);
     return {
       ...base,
       status: signed ? "signed" : "pending",
       // A disabled (weight-0) signer cannot help reach the threshold.
-      weightNeeded: signer.weight > 0 ? Math.min(signer.weight, shortfall) : 0,
+      weightNeeded:
+        evaluationStatus !== "supported"
+          ? null
+          : signer.weight > 0 && shortfall !== null
+            ? Math.min(signer.weight, shortfall)
+            : 0,
     };
   });
 
@@ -280,11 +340,16 @@ export function evaluateApprovalState(params: {
   );
 
   return {
+    evaluationStatus,
+    evaluationReasons,
     collectedWeight,
     requiredWeight,
-    ready: requiredWeight > 0 ? collectedWeight >= requiredWeight : true,
+    ready:
+      evaluationStatus === "supported" &&
+      requiredWeight !== null &&
+      (requiredWeight > 0 ? collectedWeight >= requiredWeight : true),
     signers,
-    remainingWeight: remainingFor(requiredWeight),
+    remainingWeight: requiredWeight === null ? null : remainingFor(requiredWeight),
     thresholds: thresholdProgress,
     coverage,
     unattributableSigners,
@@ -300,7 +365,8 @@ export function evaluateApprovalState(params: {
  * envelope towards the threshold.
  */
 export function pendingSigners(state: MultisigApprovalState): string[] {
-  if (state.ready) return [];
+  if (state.evaluationStatus !== "supported" || state.ready || state.requiredWeight === null)
+    return [];
   let remaining = state.requiredWeight - state.collectedWeight;
   const waiting: string[] = [];
   for (const signer of state.signers) {
@@ -315,6 +381,9 @@ export function pendingSigners(state: MultisigApprovalState): string[] {
 
 /** The canonical summary line the tracker displays. */
 export function approvalSummary(state: MultisigApprovalState): string {
+  if (state.evaluationStatus !== "supported") {
+    return `Approval threshold cannot be evaluated: ${state.evaluationReasons.join(" ")}`;
+  }
   const who = state.signers
     .map((signer) => `${signer.label} [${signer.status === "signed" ? "Signed" : "Pending"}]`)
     .join(", ");
@@ -330,18 +399,50 @@ export function approvalSummary(state: MultisigApprovalState): string {
  */
 export function remainingWeightSummary(state: MultisigApprovalState): string {
   const governing = THRESHOLD_LABELS.med;
-  if (state.remainingWeight === null) {
-    const count = state.unattributableSigners.length;
-    const detail =
-      count > 0
-        ? `${count} signer${count === 1 ? "" : "s"} of a type that cannot be matched from envelope signatures`
-        : "the envelope signatures could not be matched unambiguously to account signers";
-    return `Remaining weight at the ${governing.toLowerCase()} is unknown: ${detail}.`;
+  if (state.evaluationStatus !== "supported") {
+    return `Threshold status is ${state.evaluationStatus}: ${state.evaluationReasons.join(" ")}`;
   }
   if (state.remainingWeight === 0) {
     return `No further signer weight is required at the ${governing.toLowerCase()}.`;
   }
   return `${state.remainingWeight} more signer weight is required at the ${governing.toLowerCase()}.`;
+}
+
+/** Describe signer and threshold changes between two live account snapshots. */
+export function signerRuleChanges(
+  previous: MultisigApprovalState,
+  current: MultisigApprovalState,
+): string[] {
+  const changes: string[] = [];
+  const previousSigners = new Map(previous.signers.map((signer) => [signer.key, signer]));
+  const currentSigners = new Map(current.signers.map((signer) => [signer.key, signer]));
+
+  for (const [key, signer] of previousSigners) {
+    const updated = currentSigners.get(key);
+    if (!updated) {
+      changes.push(`${signer.label} (${key}) was removed.`);
+    } else if (updated.weight !== signer.weight) {
+      changes.push(`${updated.label} weight changed from ${signer.weight} to ${updated.weight}.`);
+    }
+  }
+  for (const [key, signer] of currentSigners) {
+    if (!previousSigners.has(key)) {
+      changes.push(`${signer.label} (${key}) was added with weight ${signer.weight}.`);
+    }
+  }
+
+  for (const level of ["low", "med", "high"] as const) {
+    const before = previous.thresholds.find(
+      (threshold) => threshold.level === level,
+    )?.requiredWeight;
+    const after = current.thresholds.find((threshold) => threshold.level === level)?.requiredWeight;
+    if (before !== after) {
+      changes.push(
+        `${THRESHOLD_LABELS[level]} changed from ${before ?? "unknown"} to ${after ?? "unknown"}.`,
+      );
+    }
+  }
+  return changes;
 }
 
 /**
@@ -352,6 +453,7 @@ export function remainingWeightSummary(state: MultisigApprovalState): string {
  * by definition and returns 100.
  */
 export function approvalPercent(state: MultisigApprovalState): number {
+  if (state.evaluationStatus !== "supported" || state.requiredWeight === null) return 0;
   if (state.requiredWeight <= 0) return 100;
   return Math.min(100, Math.round((state.collectedWeight / state.requiredWeight) * 100));
 }

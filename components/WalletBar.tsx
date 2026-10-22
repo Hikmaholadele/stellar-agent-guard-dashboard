@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useGuard } from "./GuardProvider.tsx";
 import { AddressText, ErrorBlock, short, useAddressLabel } from "./bits.tsx";
 import { AddressBookModal } from "./AddressBookModal.tsx";
@@ -26,6 +26,12 @@ import {
 } from "../lib/guard/networkSwitch.ts";
 import { OBSERVER_BADGE_LABEL, WRITE_DISABLED_HINT } from "../lib/guard/observerMode.ts";
 import { usePrivacy } from "../lib/guard/privacyStore.ts";
+import {
+  clearWriteInterruption,
+  getWriteInterruption,
+  recoveryGuidance,
+  subscribeWriteInterruption,
+} from "../lib/guard/writeReview.ts";
 
 export function WalletBar() {
   const {
@@ -57,6 +63,16 @@ export function WalletBar() {
   const [switchOutcome, setSwitchOutcome] = useState<NetworkSwitchOutcome | null>(null);
   const [renameTarget, setRenameTarget] = useState<GuardInstance | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<GuardInstance | null>(null);
+  // The last write the wallet interrupted, published by the write path. The
+  // store holds no envelope and exposes no retry: reconnecting only clears the
+  // way for a *fresh* review (issues #340, #341).
+  const interruptionState = useSyncExternalStore(
+    subscribeWriteInterruption,
+    getWriteInterruption,
+    () => null,
+  );
+  const interruptionGuidance =
+    interruptionState === null ? null : recoveryGuidance(interruptionState.interruption);
 
   const selected = instances.find((instance) => instance.guard === guard);
   const guardNickname = useAddressLabel(guard);
@@ -197,6 +213,28 @@ export function WalletBar() {
               </>
             )}
           </div>
+
+          {interruptionGuidance && (
+            <div className="notice warn" role="alert" data-testid="write-interruption">
+              <strong>{interruptionGuidance.headline}</strong>
+              <span className="tiny">{interruptionGuidance.detail}</span>
+              <span className="tiny">{interruptionGuidance.nextStep}</span>
+              <div className="row" style={{ marginTop: 8 }}>
+                {!wallet && (
+                  <button onClick={() => setPickerOpen(true)} disabled={connecting}>
+                    {connecting ? "Waiting for wallet…" : "Reconnect wallet"}
+                  </button>
+                )}
+                <button className="secondary" onClick={() => clearWriteInterruption()}>
+                  Dismiss
+                </button>
+              </div>
+              <span className="tiny muted">
+                Nothing is resubmitted automatically. Review the call again once the wallet is back
+                on the original account.
+              </span>
+            </div>
+          )}
 
           {networkMismatch && (
             <div className="notice warn" role="alert" data-testid="network-mismatch">

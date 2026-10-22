@@ -175,16 +175,16 @@ export function FleetTable() {
         </div>
       </div>
 
-      <div className="scrolly" style={{ marginTop: 14 }}>
-        <table className="events">
+      <div className="scrolly table-stack" style={{ marginTop: 14 }}>
+        <table className="events stack">
           <thead>
             <tr>
-              <th>Guard</th>
-              <th>Network</th>
-              <th>Status</th>
-              <th>24h Spend</th>
-              <th>DMS Countdown</th>
-              <th>Actions</th>
+              <th scope="col">Guard</th>
+              <th scope="col">Network</th>
+              <th scope="col">Status</th>
+              <th scope="col">24h Spend</th>
+              <th scope="col">DMS Countdown</th>
+              <th scope="col">Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -249,20 +249,24 @@ export function FleetTable() {
             {tableState.kind === "rows" &&
               filteredAndSorted.map((row) => (
                 <tr key={row.contact.address}>
-                  <td>
+                  <td data-label="Guard">
                     <div>
                       <strong>{row.contact.label}</strong>
                     </div>
                     <div className="mono tiny">{starLink(row.contact.address)}</div>
                   </td>
-                  <td className="tiny">{row.network}</td>
-                  <td>{renderStatus(row.derivedStatus)}</td>
-                  <td className="mono tiny">{formatStroopsWithUnit(row.spend24h)}</td>
-                  <td className="mono tiny">
+                  <td className="tiny" data-label="Network">
+                    {row.network}
+                  </td>
+                  <td data-label="Status">{renderStatus(row.derivedStatus)}</td>
+                  <td className="mono tiny" data-label="24h Spend">
+                    {formatStroopsWithUnit(row.spend24h)}
+                  </td>
+                  <td className="mono tiny" data-label="DMS Countdown">
                     {row.dmsCountdownSecs !== null ? `${row.dmsCountdownSecs}s` : "—"}
                   </td>
-                  <td>
-                    <div className="row" style={{ gap: "8px" }}>
+                  <td data-label="Actions">
+                    <div className="row" style={{ gap: "8px", flexWrap: "wrap" }}>
                       <button
                         className="secondary"
                         style={{ padding: "4px 8px", fontSize: "0.8em" }}

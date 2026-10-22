@@ -28,6 +28,8 @@ export interface ModalFocusOptions {
   containerRef: RefObject<HTMLElement | null>;
   /** The control that opened the dialog; it receives focus back on close. */
   returnFocusRef: RefObject<HTMLElement | null>;
+  /** An available control to focus if the original trigger cannot receive focus. */
+  fallbackFocusRef?: RefObject<HTMLElement | null>;
   /** Called on Escape. */
   onDismiss: () => void;
 }
@@ -39,6 +41,7 @@ export function useModalFocus({
   open,
   containerRef,
   returnFocusRef,
+  fallbackFocusRef,
   onDismiss,
 }: ModalFocusOptions): void {
   // The dismiss callback is almost always a fresh closure, so it is read through
@@ -97,7 +100,10 @@ export function useModalFocus({
       // effect started would be null (the row is unmounted while the dialog is
       // open) or a detached node.
       // eslint-disable-next-line react-hooks/exhaustive-deps -- deliberate late ref read, see above
-      returnFocusRef.current?.focus();
+      const returnFocusTarget = returnFocusRef.current;
+      returnFocusTarget?.focus();
+      // eslint-disable-next-line react-hooks/exhaustive-deps -- fallback is attached in the closing commit.
+      if (document.activeElement !== returnFocusTarget) fallbackFocusRef?.current?.focus();
     };
-  }, [open, containerRef, returnFocusRef]);
+  }, [open, containerRef, returnFocusRef, fallbackFocusRef]);
 }

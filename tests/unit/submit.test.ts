@@ -3,16 +3,30 @@ import { describe, it } from "node:test";
 import {
   createTransactionEnvelope,
   detectExpiration,
+  evaluateSignedEnvelopePreflight,
+  preflightSignedEnvelope,
   assembleFromSimulation,
   diagnosticEventsOf,
   describeRejectedResult,
+  invokeWithWallet,
+  type WalletSigner,
 } from "../../lib/guard/submit.ts";
+import { WalletUserRejectedError } from "../../lib/guard/walletConnector.ts";
+import {
+  loadTxHistory,
+  clearTxHistory,
+  TX_HISTORY_STORAGE_KEY,
+} from "../../lib/guard/txHistory.ts";
 import {
   Account,
   Address,
   Contract,
+  Keypair,
   Operation,
   SorobanDataBuilder,
+  Transaction,
+  TransactionBuilder,
+  rpc,
   xdr,
 } from "@stellar/stellar-sdk";
 
@@ -104,6 +118,109 @@ function makeSimulationWithAuth(
 const GUARD_CONTRACT = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
 const SIGNER_ADDRESS = "GA76DICZHOAA3L2OUCHG4X6J6DMM2NDEPLUWMK4PVLR2YTXZADHJZIXD";
 const PASSPHRASE = "Test SDF Network ; September 2015";
+
+describe("signed envelope preflight", () => {
+  it("recognizes a current sequence and active time bounds", () => {
+    const result = evaluateSignedEnvelopePreflight({
+      sequence: "6",
+      accountSequence: "5",
+      timeBounds: { minTime: "900", maxTime: "1100" },
+      ledgerCloseTime: "1000",
+      checkedAt: "2026-10-21T12:00:00.000Z",
+    });
+    assert.equal(result.sequence.status, "current");
+    assert.equal(result.expiration.status, "active");
+    assert.equal(result.checkedAt, "2026-10-21T12:00:00.000Z");
+  });
+
+  it("identifies stale sequences, expired envelopes, and envelopes not yet valid", () => {
+    const stale = evaluateSignedEnvelopePreflight({
+      sequence: "5",
+      accountSequence: "5",
+      timeBounds: { minTime: "900", maxTime: "1100" },
+      ledgerCloseTime: "1000",
+    });
+    assert.equal(stale.sequence.status, "stale");
+
+    const expired = evaluateSignedEnvelopePreflight({
+      sequence: "6",
+      accountSequence: "5",
+      timeBounds: { minTime: "900", maxTime: "1000" },
+      ledgerCloseTime: "1000",
+    });
+    assert.equal(expired.expiration.status, "expired");
+
+    const notYetValid = evaluateSignedEnvelopePreflight({
+      sequence: "6",
+      accountSequence: "5",
+      timeBounds: { minTime: "1001", maxTime: "1100" },
+      ledgerCloseTime: "1000",
+    });
+    assert.equal(notYetValid.expiration.status, "not_yet_valid");
+  });
+
+  it("marks unavailable account or ledger reads as unknown", () => {
+    const result = evaluateSignedEnvelopePreflight({
+      sequence: "6",
+      timeBounds: { minTime: "900", maxTime: "1100" },
+    });
+    assert.equal(result.sequence.status, "unknown");
+    assert.equal(result.expiration.status, "unknown");
+  });
+
+  it("uses fresh chain reads and leaves the imported envelope unchanged", async () => {
+    const transaction = new TransactionBuilder(new Account(SIGNER_ADDRESS, "5"), {
+      fee: "100",
+      networkPassphrase: PASSPHRASE,
+    })
+      .addOperation(Operation.accountMerge({ destination: SIGNER_ADDRESS }))
+      .setTimebounds(900, 1100)
+      .build();
+    const importedXdr = transaction.toXDR();
+    const server = {
+      getAccount: async (source: string) => {
+        assert.equal(source, SIGNER_ADDRESS);
+        return new Account(SIGNER_ADDRESS, "5");
+      },
+      getLatestLedger: async () => ({ closeTime: "1000" }),
+    } as unknown as rpc.Server;
+
+    const result = await preflightSignedEnvelope(server, transaction);
+    assert.equal(result.sequence.status, "current");
+    assert.equal(result.expiration.status, "active");
+    assert.equal(transaction.toXDR(), importedXdr);
+  });
+
+  it("keeps each failed RPC observation unknown instead of guessing", async () => {
+    const transaction = new TransactionBuilder(new Account(SIGNER_ADDRESS, "5"), {
+      fee: "100",
+      networkPassphrase: PASSPHRASE,
+    })
+      .addOperation(Operation.accountMerge({ destination: SIGNER_ADDRESS }))
+      .setTimeout(30)
+      .build();
+    const server = {
+      getAccount: async () => {
+        throw new Error("account read failed");
+      },
+      getLatestLedger: async () => ({ closeTime: "1000" }),
+    } as unknown as rpc.Server;
+
+    const result = await preflightSignedEnvelope(server, transaction);
+    assert.equal(result.sequence.status, "unknown");
+    assert.equal(result.expiration.status, "active");
+
+    const failedLedgerServer = {
+      getAccount: async () => new Account(SIGNER_ADDRESS, "5"),
+      getLatestLedger: async () => {
+        throw new Error("ledger read failed");
+      },
+    } as unknown as rpc.Server;
+    const ledgerFailure = await preflightSignedEnvelope(failedLedgerServer, transaction);
+    assert.equal(ledgerFailure.sequence.status, "current");
+    assert.equal(ledgerFailure.expiration.status, "unknown");
+  });
+});
 
 describe("assembleFromSimulation — create_contract authorization preservation", () => {
   it("attaches a recorded create_contract auth entry to the assembled operation", () => {
@@ -273,5 +390,160 @@ describe("describeRejectedResult", () => {
   it("returns a fallback when the object has no result data", () => {
     const description = describeRejectedResult({});
     assert.equal(description, "no result data returned by the network");
+  });
+});
+
+/**
+ * Wallet-bound write boundaries (#340) and disconnect recovery (#341).
+ *
+ * These run the real `invokeWithWallet` pipeline against a fake RPC, so the
+ * assertions are about what the write path actually does: a wallet account that
+ * moved mid-flight stops the write before the envelope is signed, a vanished
+ * provider becomes a phase-specific recoverable result, and nothing is ever
+ * broadcast or resubmitted automatically.
+ */
+function makeWalletBoundaryServer(sendCalls: string[]): rpc.Server {
+  const successfulSimulation = () => {
+    const data = new SorobanDataBuilder()
+      .setReadWrite([])
+      .setResourceFee(BigInt(500))
+      .setResources(1_000_000, 0, 0)
+      .build();
+    return {
+      transactionData: new SorobanDataBuilder(data),
+      minResourceFee: "500",
+      result: { auth: [], retval: xdr.ScVal.scvVoid() },
+      events: [],
+      latestLedger: 200,
+      cost: { cpuInsns: "0", memBytes: "0" },
+      stateChanges: [],
+    };
+  };
+  return {
+    getAccount: async (address: string) => new Account(address, "1"),
+    simulateTransaction: async () => successfulSimulation(),
+    sendTransaction: async () => {
+      sendCalls.push("sent");
+      return { status: "PENDING", hash: "ab".repeat(32), latestLedger: 200 };
+    },
+    getTransaction: async () => ({
+      status: rpc.Api.GetTransactionStatus.SUCCESS,
+      ledger: 201,
+      hash: "ab".repeat(32),
+    }),
+  } as unknown as rpc.Server;
+}
+
+function makeKeypairSigner(options: {
+  liveAddress: () => string | null;
+  keypair?: ReturnType<typeof Keypair.random>;
+  onSignTransaction?: () => void;
+}): WalletSigner {
+  const keypair = options.keypair ?? Keypair.random();
+  return {
+    address: keypair.publicKey(),
+    currentAddress: async () => options.liveAddress(),
+    async signTransaction(transactionXdr: string): Promise<string> {
+      options.onSignTransaction?.();
+      const transaction = TransactionBuilder.fromXDR(transactionXdr, PASSPHRASE) as Transaction;
+      transaction.sign(keypair);
+      return transaction.toXDR();
+    },
+    async signAuthEntry(): Promise<string> {
+      throw new Error("this call needs no authorization entries");
+    },
+  };
+}
+
+const WRITE_REQUEST = {
+  contract: GUARD_CONTRACT,
+  fn: "freeze",
+  args: [] as xdr.ScVal[],
+  passphrase: PASSPHRASE,
+  pollAttempts: 1,
+  pollIntervalMs: 1,
+};
+
+describe("wallet-bound write boundaries", () => {
+  it("refuses to sign the envelope after the wallet account changed", async () => {
+    const keypair = Keypair.random();
+    const sendCalls: string[] = [];
+    let signed = 0;
+    const result = await invokeWithWallet({
+      ...WRITE_REQUEST,
+      server: makeWalletBoundaryServer(sendCalls),
+      signer: makeKeypairSigner({
+        keypair,
+        liveAddress: () => "GD5S5O2MZ6FSMFH6QILG37KSQNRVR3RPSWBTTV4JOUJ7J6TWLLL5LAVS",
+        onSignTransaction: () => {
+          signed += 1;
+        },
+      }),
+    });
+
+    assert.equal(result.kind, "refused");
+    if (result.kind !== "refused") return;
+    assert.equal(result.stage, "wallet");
+    assert.equal(result.writeInterruption?.kind, "account-changed");
+    assert.equal(result.writeInterruption?.phase, "envelope");
+    assert.equal(signed, 0, "the envelope must never be signed for a different account");
+    assert.deepEqual(sendCalls, [], "nothing may be broadcast");
+    assert.match(result.detail, /fresh review/i);
+  });
+
+  it("reports a disconnect during signing as recoverable and phase-specific", async () => {
+    const sendCalls: string[] = [];
+    const result = await invokeWithWallet({
+      ...WRITE_REQUEST,
+      server: makeWalletBoundaryServer(sendCalls),
+      signer: makeKeypairSigner({ liveAddress: () => null }),
+    });
+
+    assert.equal(result.kind, "refused");
+    if (result.kind !== "refused") return;
+    assert.equal(result.stage, "wallet");
+    assert.equal(result.writeInterruption?.kind, "wallet-disconnected");
+    assert.equal(result.writeInterruption?.phase, "envelope");
+    assert.match(result.detail, /signature may have been produced/i);
+    assert.deepEqual(sendCalls, []);
+  });
+
+  it("stops before broadcast when the provider disappears at submission", async () => {
+    const keypair = Keypair.random();
+    const sendCalls: string[] = [];
+    let reads = 0;
+    const result = await invokeWithWallet({
+      ...WRITE_REQUEST,
+      server: makeWalletBoundaryServer(sendCalls),
+      signer: makeKeypairSigner({
+        keypair,
+        liveAddress: () => {
+          reads += 1;
+          return reads === 1 ? keypair.publicKey() : null;
+        },
+      }),
+    });
+
+    assert.equal(result.kind, "refused");
+    if (result.kind !== "refused") return;
+    assert.equal(result.writeInterruption?.phase, "submission");
+    if (result.writeInterruption?.kind !== "wallet-disconnected") {
+      assert.fail("expected a wallet disconnect at submission");
+    }
+    assert.match(result.detail, /may be on chain/i);
+    assert.deepEqual(sendCalls, [], "no retry is attempted after a disconnect");
+  });
+
+  it("submits unchanged when the wallet stays on the reviewed account", async () => {
+    const keypair = Keypair.random();
+    const sendCalls: string[] = [];
+    const result = await invokeWithWallet({
+      ...WRITE_REQUEST,
+      server: makeWalletBoundaryServer(sendCalls),
+      signer: makeKeypairSigner({ keypair, liveAddress: () => keypair.publicKey() }),
+    });
+
+    assert.equal(result.kind, "submitted");
+    assert.deepEqual(sendCalls, ["sent"]);
   });
 });

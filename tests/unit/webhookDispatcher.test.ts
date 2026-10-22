@@ -315,6 +315,23 @@ describe("dispatchWebhook", () => {
     assert.match(result.error ?? "", /marked signed/);
     assert.equal(calls.length, 0);
   });
+
+  test("a destination carrying credentials is skipped, never put on the wire", async () => {
+    const { fetch: stub, calls } = recordingFetch(() => ({ status: 200 }));
+    const result = await dispatchWebhook(
+      buildWebhookPayload({
+        event: "FREEZE_ACTIVATED",
+        guard: GUARD,
+        network: "testnet",
+        timestamp: TIMESTAMP,
+      }),
+      settings({ url: "https://user:pass@hooks.example.com/x" }),
+      { fetch: stub },
+    );
+    assert.equal(result.outcome, "skipped");
+    assert.match(result.error ?? "", /must not carry credentials/);
+    assert.equal(calls.length, 0);
+  });
 });
 
 // ── URL validation ─────────────────────────────────────────────────────────
@@ -340,6 +357,41 @@ describe("validateWebhookUrl", () => {
     assert.match(validateWebhookUrl("") ?? "", /Enter a webhook URL/);
     assert.match(validateWebhookUrl("not a url") ?? "", /not a URL/);
     assert.match(validateWebhookUrl("ftp://example.com/x") ?? "", /Unsupported scheme/);
+  });
+
+  test("embedded credentials are refused — the userinfo would be sent to the real host", () => {
+    for (const url of [
+      "https://user:pass@hooks.example.com/x",
+      "https://user@hooks.example.com/x",
+      "https://:pass@hooks.example.com/x",
+      "https://@hooks.example.com/x",
+    ]) {
+      assert.match(validateWebhookUrl(url) ?? "", /must not carry credentials/, url);
+    }
+  });
+
+  test("credentials are refused even on loopback, where the scheme itself is allowed", () => {
+    // The userinfo check runs before the localhost exemption: a credential is
+    // never something to put on the wire, secure host or not.
+    assert.match(
+      validateWebhookUrl("http://user@localhost:3000/hook") ?? "",
+      /must not carry credentials/,
+    );
+  });
+
+  test("a malformed host that will not parse is refused rather than dispatched to", () => {
+    for (const url of ["https://", "http://", "https://:8080", "https://exa mple.com"]) {
+      assert.notEqual(validateWebhookUrl(url), null, url);
+    }
+  });
+
+  test("an @ that belongs to the path is not read as a credential", () => {
+    assert.equal(validateWebhookUrl("https://hooks.example.com/@team/x"), null);
+  });
+
+  test("an https URL with a port and a bare-IPv6 loopback both validate", () => {
+    assert.equal(validateWebhookUrl("https://hooks.example.com:8443/x"), null);
+    assert.equal(validateWebhookUrl("http://[::1]:8080/hook"), null);
   });
 });
 

@@ -3,6 +3,12 @@ import { describe, test } from "node:test";
 import { xdr } from "@stellar/stellar-sdk";
 import { decodeStorageFootprint } from "../../lib/guard/storage.ts";
 import {
+  classifyStorageError,
+  decodeVersionedRecord,
+  encodeVersionedRecord,
+  writeStoredValue,
+} from "../../lib/guard/versionedStorage.ts";
+import {
   MOCK_GUARD,
   i128,
   persistentDataEntry,
@@ -131,5 +137,78 @@ describe("decodeStorageFootprint", () => {
     }).toXdr("base64");
 
     assert.equal(decodeStorageFootprint(codeEntry, "Policy").value, "Uninitialized");
+  });
+});
+
+describe("versioned browser storage", () => {
+  const decode = (raw: string) =>
+    decodeVersionedRecord({
+      raw,
+      schema: "test/record",
+      version: 2,
+      migrations: {
+        0: (value) => ({ count: (value as { count: number }).count }),
+        1: (value) => ({ ...(value as object), ready: true }),
+      },
+      validate: (value): value is { count: number; ready: boolean } =>
+        typeof value === "object" &&
+        value !== null &&
+        typeof (value as { count?: unknown }).count === "number" &&
+        typeof (value as { ready?: unknown }).ready === "boolean",
+    });
+
+  test("migrates an older record deterministically", () => {
+    const result = decode(JSON.stringify({ count: 4 }));
+    assert.deepEqual(result, { ok: true, value: { count: 4, ready: true }, needsMigration: true });
+  });
+
+  test("accepts current records and leaves unknown future versions exportable", () => {
+    const current = encodeVersionedRecord("test/record", 2, { count: 8, ready: true });
+    assert.deepEqual(decode(current), {
+      ok: true,
+      value: { count: 8, ready: true },
+      needsMigration: false,
+    });
+    const future = encodeVersionedRecord("test/record", 3, { count: 9, ready: true });
+    assert.deepEqual(decode(future), {
+      ok: false,
+      error: "future-version",
+      recoveryExport: future,
+    });
+  });
+
+  test("preserves malformed records and reports failed migrations", () => {
+    const malformed = "{partially written";
+    assert.deepEqual(decode(malformed), { ok: false, error: "parse", recoveryExport: malformed });
+    const failed = decodeVersionedRecord({
+      raw: JSON.stringify({ count: 1 }),
+      schema: "test/record",
+      version: 2,
+      migrations: {
+        0: () => {
+          throw new Error("migration failed");
+        },
+      },
+      validate: (_value): _value is { count: number; ready: boolean } => true,
+    });
+    assert.equal(failed.ok, false);
+    if (!failed.ok) assert.equal(failed.error, "migration");
+  });
+
+  test("classifies storage quota and permission failures", () => {
+    assert.equal(classifyStorageError({ name: "QuotaExceededError" }), "quota");
+    assert.equal(classifyStorageError({ name: "SecurityError" }), "permission");
+    assert.equal(writeStoredValue(null, "key", "value").ok, false);
+    const denied = writeStoredValue(
+      {
+        getItem: () => null,
+        setItem: () => {
+          throw { name: "QuotaExceededError" };
+        },
+      },
+      "key",
+      "value",
+    );
+    assert.deepEqual(denied, { ok: false, error: "quota" });
   });
 });

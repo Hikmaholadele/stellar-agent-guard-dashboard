@@ -3,10 +3,14 @@ import { describe, it } from "node:test";
 import {
   TAB_SYNC_CHANNEL,
   TAB_SYNC_STORAGE_KEY,
+  acquireGuardWriteLock,
   createTabSync,
   isTabSyncEvent,
+  subscribeGuardWriteLock,
   type TabChannel,
   type TabEventTarget,
+  type GuardWriteStorage,
+  type TabLifecycleTarget,
   type TabStorage,
   type TabStorageEvent,
   type TabSyncEvent,
@@ -68,10 +72,13 @@ function createMockHub(options: { echo?: boolean } = {}) {
 /** A fake `Storage` with the same tiny surface the fallback uses. */
 function createMockStorage() {
   const map = new Map<string, string>();
-  const storage: TabStorage = {
+  const storage: GuardWriteStorage = {
     getItem: (key) => map.get(key) ?? null,
     setItem: (key, value) => {
       map.set(key, value);
+    },
+    removeItem: (key) => {
+      map.delete(key);
     },
   };
   return { storage, raw: () => map.get(TAB_SYNC_STORAGE_KEY) ?? null };
@@ -99,6 +106,144 @@ function createMockEventTarget() {
 
 const FIXED_TIME = new Date("2026-09-25T12:00:00.000Z");
 const GUARD = "CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7";
+
+function createMockLifecycleTarget() {
+  const listeners = new Set<() => void>();
+  const target: TabLifecycleTarget = {
+    addEventListener(_type, listener) {
+      listeners.add(listener);
+    },
+    removeEventListener(_type, listener) {
+      listeners.delete(listener);
+    },
+  };
+  return {
+    target,
+    pagehide() {
+      for (const listener of [...listeners]) listener();
+    },
+  };
+}
+
+describe("guard write leases", () => {
+  it("prevents a duplicate guard/action claim and releases it on completion", () => {
+    const { storage } = createMockStorage();
+    const scope = { guard: GUARD, action: "freeze" as const, network: "testnet" };
+    const first = acquireGuardWriteLock(scope, {
+      storage,
+      lifecycleTarget: null,
+      randomId: () => "tab-a",
+      now: () => FIXED_TIME.getTime(),
+    });
+    assert.ok(first);
+    assert.equal(
+      acquireGuardWriteLock(scope, {
+        storage,
+        lifecycleTarget: null,
+        randomId: () => "tab-b",
+        now: () => FIXED_TIME.getTime(),
+      }),
+      null,
+    );
+
+    first.release();
+    const next = acquireGuardWriteLock(scope, {
+      storage,
+      lifecycleTarget: null,
+      randomId: () => "tab-b",
+      now: () => FIXED_TIME.getTime(),
+    });
+    assert.ok(next, "completion must release the claim");
+    next.release();
+  });
+
+  it("expires abandoned claims and scopes them by guard, action, and network", () => {
+    const { storage } = createMockStorage();
+    let currentTime = FIXED_TIME.getTime();
+    const options = {
+      storage,
+      lifecycleTarget: null,
+      now: () => currentTime,
+      ttlMs: 100,
+    };
+    const claim = acquireGuardWriteLock(
+      { guard: GUARD, action: "freeze", network: "testnet" },
+      { ...options, randomId: () => "tab-a" },
+    );
+    assert.ok(claim);
+    assert.ok(
+      acquireGuardWriteLock(
+        { guard: GUARD, action: "unfreeze", network: "testnet" },
+        { ...options, randomId: () => "tab-b" },
+      ),
+      "the opposite action has a separate pending state",
+    );
+    assert.ok(
+      acquireGuardWriteLock(
+        { guard: GUARD, action: "freeze", network: "mainnet" },
+        { ...options, randomId: () => "tab-c" },
+      ),
+      "another network has a separate pending state",
+    );
+
+    currentTime += 101;
+    const reclaimed = acquireGuardWriteLock(
+      { guard: GUARD, action: "freeze", network: "testnet" },
+      { ...options, randomId: () => "tab-d" },
+    );
+    assert.ok(reclaimed, "an abandoned claim must be reclaimable after expiry");
+    claim.release();
+    reclaimed.release();
+  });
+
+  it("releases its claim when the tab is closed", () => {
+    const { storage } = createMockStorage();
+    const lifecycle = createMockLifecycleTarget();
+    const scope = { guard: GUARD, action: "unfreeze" as const, network: "testnet" };
+    const claim = acquireGuardWriteLock(scope, {
+      storage,
+      lifecycleTarget: lifecycle.target,
+      randomId: () => "tab-a",
+      now: () => FIXED_TIME.getTime(),
+    });
+    assert.ok(claim);
+
+    lifecycle.pagehide();
+    assert.equal(
+      acquireGuardWriteLock(scope, {
+        storage,
+        lifecycleTarget: null,
+        randomId: () => "tab-b",
+        now: () => FIXED_TIME.getTime(),
+      }) !== null,
+      true,
+    );
+  });
+
+  it("notifies local subscribers when a claim starts and releases", () => {
+    const { storage } = createMockStorage();
+    const scope = { guard: GUARD, action: "freeze" as const, network: "testnet" };
+    const updates: Array<string | null> = [];
+    const unsubscribe = subscribeGuardWriteLock(
+      scope,
+      (record) => {
+        updates.push(record?.owner ?? null);
+      },
+      { storage, eventTarget: null, now: () => FIXED_TIME.getTime() },
+    );
+    const claim = acquireGuardWriteLock(scope, {
+      storage,
+      lifecycleTarget: null,
+      randomId: () => "tab-a",
+      now: () => FIXED_TIME.getTime(),
+    });
+    assert.ok(claim);
+    claim.release();
+    unsubscribe();
+
+    assert.deepEqual(updates, [null, "tab-a", null]);
+  });
+});
 
 describe("tab sync event validation", () => {
   it("accepts a well-formed event", () => {

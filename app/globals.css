@@ -500,6 +500,35 @@ table.asset-caps input {
 .scrolly {
   max-height: 340px;
   overflow-y: auto;
+  /* A wide table scrolls itself instead of widening the page. */
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/*
+ * Reduced motion (#339).
+ *
+ * The dashboard is used for long monitoring and incident response, where
+ * pulsing and sliding is noise at best and a vestibular barrier at worst. One
+ * blanket rule keeps every animation and transition (present and future) off
+ * when the OS asks for it; a 0.001ms duration rather than `animation: none`
+ * means end states still apply, so a state change that used to animate in is
+ * shown immediately instead of disappearing with the animation. Nothing here
+ * replaces a status change with stillness-as-silence: the tiers, decisions and
+ * banner wording are all text, and the skeleton/toast/alarm end states remain
+ * visible.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    transition-delay: 0ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 .muted {
@@ -589,6 +618,104 @@ code {
   .form-inline-row {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  /*
+   * Stacked data tables (#338).
+   *
+   * Below the breakpoint a dense table cannot keep the value next to its
+   * header, so each row becomes its own card: the header row stays in the DOM
+   * (visually hidden, still a semantic <th> for assistive tech) and every cell
+   * repeats its column name through `data-label`. The relationship between a
+   * value and its header is therefore never lost — it moves from position to
+   * text — and long addresses, hashes and error text wrap instead of forcing a
+   * horizontal scroll that would hide the action buttons.
+   */
+  table.events.stack,
+  table.events.stack tbody,
+  table.events.stack tr,
+  table.events.stack td {
+    display: block;
+    width: 100%;
+  }
+
+  table.events.stack thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  table.events.stack tbody tr {
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    margin-bottom: 10px;
+    padding: 10px 12px;
+    background: var(--panel-2);
+  }
+
+  table.events.stack tbody tr.severity-blocked {
+    background: #1c1113;
+  }
+
+  table.events.stack tbody tr.severity-blocked td:first-child,
+  table.events.stack tbody tr.severity-diagnostic td:first-child {
+    box-shadow: none;
+  }
+
+  table.events.stack tbody tr.severity-blocked {
+    box-shadow: inset 3px 0 0 var(--danger);
+  }
+
+  table.events.stack tbody tr.severity-diagnostic {
+    box-shadow: inset 3px 0 0 var(--warn);
+  }
+
+  table.events.stack td {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    border-bottom: 0;
+    padding: 4px 0;
+    min-width: 0;
+    /* Long C…/G… addresses, transaction hashes and host error strings wrap in
+       place rather than widening the row and clipping the status text. */
+    overflow-wrap: anywhere;
+  }
+
+  table.events.stack td::before {
+    content: attr(data-label);
+    flex: 0 0 34%;
+    max-width: 34%;
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding-top: 1px;
+  }
+
+  /* Action cells and their buttons wrap onto as many lines as needed, so they
+     stay reachable and never overlap the neighbouring value. */
+  table.events.stack td .row {
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+
+  table.events.stack td button {
+    min-height: 32px;
+  }
+
+  /* A stacked table is as tall as its content; a fixed-height scroller would
+     hide rows behind a second scroll region on a phone. */
+  .scrolly.table-stack {
+    max-height: none;
+    overflow-x: visible;
   }
 }
 

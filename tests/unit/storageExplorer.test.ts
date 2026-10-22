@@ -25,6 +25,8 @@ import {
   decodeStorageEntry,
   explorerReducer,
   formatAsJson,
+  getOperatorStorageCategories,
+  clearOperatorStorageCategory,
   jsonTree,
   storageKeyLabel,
   summarizeEntries,
@@ -43,6 +45,15 @@ import {
   u64,
   windowScVal,
 } from "../mocks/sorobanFixtures.ts";
+import { ADDRESS_BOOK_STORAGE_KEY } from "../../lib/guard/addressBook.ts";
+import { TX_HISTORY_STORAGE_KEY } from "../../lib/guard/txHistory.ts";
+import { LAYOUT_STORAGE_KEY } from "../../lib/guard/layoutStore.ts";
+import { THEME_STORAGE_KEY } from "../../lib/guard/presentationStorageKeys.ts";
+import { INSTANCE_STORAGE_PREFIX, LEGACY_INSTANCE_STORAGE_KEY } from "../../lib/guard/instance.ts";
+import { SCOPED_STORAGE_PREFIX } from "../../lib/guard/guardScoped.ts";
+import { installDom, loadReact } from "./domHarness.ts";
+import { GuardContext, type GuardContextValue } from "../../components/GuardProvider.tsx";
+import { StorageExplorerButton } from "../../components/StorageExplorer.tsx";
 
 /** The ledger head the fixtures below are read against. */
 const CURRENT_LEDGER = 1_000;
@@ -483,5 +494,179 @@ describe("summarizeEntries", () => {
 
   test("the singular is singular", () => {
     assert.match(summarizeEntries([absentStorageEntry("a", "Policy")]), /0 of 1 entry present/);
+  });
+});
+
+describe("operator browser-local storage controls and category isolation (#332)", () => {
+  function makeFakeStore() {
+    const data = new Map<string, string>();
+    return {
+      data,
+      getItem: (k: string) => data.get(k) ?? null,
+      setItem: (k: string, v: string) => data.set(k, v),
+      removeItem: (k: string) => data.delete(k),
+    };
+  }
+
+  test("getOperatorStorageCategories lists every supported category with descriptions and counts", () => {
+    const store = makeFakeStore();
+    store.setItem(
+      TX_HISTORY_STORAGE_KEY,
+      JSON.stringify([
+        { hash: "h1", operation: "freeze", status: "confirmed", recordedAt: "2026-10-20" },
+      ]),
+    );
+    store.setItem(ADDRESS_BOOK_STORAGE_KEY, JSON.stringify([{ address: "GA...", alias: "Alice" }]));
+    store.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(["status", "txhistory"]));
+    store.setItem(THEME_STORAGE_KEY, "dark");
+    store.setItem(
+      `${INSTANCE_STORAGE_PREFIX}.testnet`,
+      JSON.stringify([{ address: "CA...", label: "My Guard" }]),
+    );
+
+    const categories = getOperatorStorageCategories(store);
+    assert.equal(categories.length, 4);
+
+    const historyCat = categories.find((c) => c.id === "history")!;
+    assert.equal(historyCat.name, "Transaction History");
+    assert.equal(historyCat.itemCount, 1);
+    assert.ok(historyCat.description.length > 0);
+
+    const addressCat = categories.find((c) => c.id === "address-book")!;
+    assert.equal(addressCat.name, "Address Book");
+    assert.equal(addressCat.itemCount, 1);
+
+    const layoutCat = categories.find((c) => c.id === "layouts")!;
+    assert.equal(layoutCat.name, "Layouts & UI Preferences");
+    assert.equal(layoutCat.itemCount, 2);
+
+    const guardCat = categories.find((c) => c.id === "guard-registry")!;
+    assert.equal(guardCat.name, "Guard Registry");
+    assert.equal(guardCat.itemCount, 1);
+  });
+
+  test("category isolation: clearing history leaves address-book, layouts, and guard-registry untouched", () => {
+    const store = makeFakeStore();
+    store.setItem(TX_HISTORY_STORAGE_KEY, JSON.stringify([{ hash: "h1" }]));
+    store.setItem(ADDRESS_BOOK_STORAGE_KEY, JSON.stringify([{ address: "GA..." }]));
+    store.setItem(LAYOUT_STORAGE_KEY, "layouts");
+    store.setItem(`${INSTANCE_STORAGE_PREFIX}.testnet`, "guards");
+
+    clearOperatorStorageCategory("history", store);
+
+    assert.equal(store.getItem(TX_HISTORY_STORAGE_KEY), null);
+    assert.equal(store.getItem(ADDRESS_BOOK_STORAGE_KEY), JSON.stringify([{ address: "GA..." }]));
+    assert.equal(store.getItem(LAYOUT_STORAGE_KEY), "layouts");
+    assert.equal(store.getItem(`${INSTANCE_STORAGE_PREFIX}.testnet`), "guards");
+  });
+
+  test("category isolation: clearing address-book leaves other categories untouched", () => {
+    const store = makeFakeStore();
+    store.setItem(TX_HISTORY_STORAGE_KEY, "history");
+    store.setItem(ADDRESS_BOOK_STORAGE_KEY, "addressbook");
+    store.setItem(LAYOUT_STORAGE_KEY, "layouts");
+    store.setItem(`${INSTANCE_STORAGE_PREFIX}.testnet`, "guards");
+
+    clearOperatorStorageCategory("address-book", store);
+
+    assert.equal(store.getItem(ADDRESS_BOOK_STORAGE_KEY), null);
+    assert.equal(store.getItem(TX_HISTORY_STORAGE_KEY), "history");
+    assert.equal(store.getItem(LAYOUT_STORAGE_KEY), "layouts");
+    assert.equal(store.getItem(`${INSTANCE_STORAGE_PREFIX}.testnet`), "guards");
+  });
+
+  test("category isolation: clearing layouts leaves other categories untouched", () => {
+    const store = makeFakeStore();
+    store.setItem(TX_HISTORY_STORAGE_KEY, "history");
+    store.setItem(ADDRESS_BOOK_STORAGE_KEY, "addressbook");
+    store.setItem(LAYOUT_STORAGE_KEY, "layouts");
+    store.setItem(THEME_STORAGE_KEY, "dark");
+    store.setItem(`${INSTANCE_STORAGE_PREFIX}.testnet`, "guards");
+
+    clearOperatorStorageCategory("layouts", store);
+
+    assert.equal(store.getItem(LAYOUT_STORAGE_KEY), null);
+    assert.equal(store.getItem(THEME_STORAGE_KEY), null);
+    assert.equal(store.getItem(TX_HISTORY_STORAGE_KEY), "history");
+    assert.equal(store.getItem(ADDRESS_BOOK_STORAGE_KEY), "addressbook");
+    assert.equal(store.getItem(`${INSTANCE_STORAGE_PREFIX}.testnet`), "guards");
+  });
+
+  test("category isolation: clearing guard-registry leaves other categories untouched", () => {
+    const store = makeFakeStore();
+    store.setItem(TX_HISTORY_STORAGE_KEY, "history");
+    store.setItem(ADDRESS_BOOK_STORAGE_KEY, "addressbook");
+    store.setItem(LAYOUT_STORAGE_KEY, "layouts");
+    store.setItem(`${INSTANCE_STORAGE_PREFIX}.testnet`, "guards");
+    store.setItem(`${SCOPED_STORAGE_PREFIX}.base.testnet.guard`, "scoped");
+    store.setItem(LEGACY_INSTANCE_STORAGE_KEY, "legacy");
+
+    clearOperatorStorageCategory("guard-registry", store);
+
+    assert.equal(store.getItem(`${INSTANCE_STORAGE_PREFIX}.testnet`), null);
+    assert.equal(store.getItem(`${SCOPED_STORAGE_PREFIX}.base.testnet.guard`), null);
+    assert.equal(store.getItem(LEGACY_INSTANCE_STORAGE_KEY), null);
+    assert.equal(store.getItem(TX_HISTORY_STORAGE_KEY), "history");
+    assert.equal(store.getItem(ADDRESS_BOOK_STORAGE_KEY), "addressbook");
+    assert.equal(store.getItem(LAYOUT_STORAGE_KEY), "layouts");
+  });
+
+  test("StorageExplorerButton confirmation dialog states that clearing local data does not change the chain", async () => {
+    installDom();
+    const { react, createRoot, act } = await loadReact();
+
+    localStorage.setItem(
+      TX_HISTORY_STORAGE_KEY,
+      JSON.stringify([
+        { hash: "h1", operation: "freeze", status: "confirmed", recordedAt: "2026-10-20" },
+      ]),
+    );
+
+    const div = document.createElement("div");
+    document.body.appendChild(div);
+    const root = createRoot(div);
+
+    await act(async () => {
+      root.render(
+        react.createElement(
+          GuardContext.Provider,
+          { value: { server: {} as any, guard: "CA..." } as GuardContextValue },
+          react.createElement(StorageExplorerButton),
+        ),
+      );
+    });
+
+    // Toggle inventory open
+    const toggleBtn = div.querySelector(
+      'button[data-testid="storage-inventory-toggle"]',
+    ) as HTMLButtonElement;
+    assert.ok(toggleBtn);
+    await act(async () => toggleBtn.click());
+
+    assert.ok(div.textContent?.includes("Operator Data Categories"));
+    assert.ok(div.textContent?.includes("Transaction History"));
+
+    // Click clear for history
+    const clearHistoryBtn = div.querySelector(
+      'button[data-testid="clear-category-history"]',
+    ) as HTMLButtonElement;
+    assert.ok(clearHistoryBtn);
+    await act(async () => clearHistoryBtn.click());
+
+    // Confirmation dialog appears
+    assert.ok(div.textContent?.includes("Clear Transaction History?"));
+    assert.ok(div.textContent?.includes("It does not change the chain"));
+
+    // Confirm clear
+    const confirmClearBtn = div.querySelector(
+      'button[data-testid="confirm-clear-history"]',
+    ) as HTMLButtonElement;
+    assert.ok(confirmClearBtn);
+    await act(async () => confirmClearBtn.click());
+
+    assert.equal(localStorage.getItem(TX_HISTORY_STORAGE_KEY), null);
+    await act(async () => root.unmount());
+    document.body.innerHTML = "";
+    localStorage.clear();
   });
 });

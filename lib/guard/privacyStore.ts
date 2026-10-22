@@ -4,6 +4,8 @@ import { useEffect, useState } from "react";
 
 export type PrivacySubscriber = (masked: boolean) => void;
 
+export const PRIVACY_MASK_STORAGE_KEY = "privacy-mask";
+
 /**
  * In-memory privacy preference store (issue #383).
  *
@@ -22,7 +24,7 @@ class PrivacyStore {
   constructor() {
     if (typeof localStorage !== "undefined") {
       try {
-        const saved = localStorage.getItem("privacy-mask");
+        const saved = localStorage.getItem(PRIVACY_MASK_STORAGE_KEY);
         if (saved !== null) {
           this.masked = saved === "true";
           this.persist = true;
@@ -48,13 +50,13 @@ class PrivacyStore {
     }
     if (this.persist && typeof localStorage !== "undefined") {
       try {
-        localStorage.setItem("privacy-mask", String(this.masked));
+        localStorage.setItem(PRIVACY_MASK_STORAGE_KEY, String(this.masked));
       } catch {
         // Ignore
       }
     } else if (!this.persist && typeof localStorage !== "undefined") {
       try {
-        localStorage.removeItem("privacy-mask");
+        localStorage.removeItem(PRIVACY_MASK_STORAGE_KEY);
       } catch {
         // Ignore
       }
@@ -72,13 +74,13 @@ class PrivacyStore {
     this.persist = persist;
     if (persist && typeof localStorage !== "undefined") {
       try {
-        localStorage.setItem("privacy-mask", String(this.masked));
+        localStorage.setItem(PRIVACY_MASK_STORAGE_KEY, String(this.masked));
       } catch {
         // Ignore
       }
     } else if (!persist && typeof localStorage !== "undefined") {
       try {
-        localStorage.removeItem("privacy-mask");
+        localStorage.removeItem(PRIVACY_MASK_STORAGE_KEY);
       } catch {
         // Ignore
       }
@@ -90,7 +92,7 @@ class PrivacyStore {
     this.persist = false;
     if (typeof localStorage !== "undefined") {
       try {
-        localStorage.removeItem("privacy-mask");
+        localStorage.removeItem(PRIVACY_MASK_STORAGE_KEY);
       } catch {
         // Ignore
       }

@@ -1049,6 +1049,14 @@ export function OutcomeBlock({
       </div>
     );
   }
+  if (result.kind === "cancelled") {
+    return (
+      <div className="warn notice" data-testid="policy-form-cancelled">
+        <span className="t">Transaction signing cancelled — nothing was broadcast</span>
+        <span className="mono tiny">{result.detail}</span>
+      </div>
+    );
+  }
   return (
     <div className="error">
       <span className="t">Broadcast but rejected on chain — {starLink(result.hash)}</span>

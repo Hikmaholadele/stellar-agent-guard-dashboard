@@ -14,14 +14,27 @@
  * never to a crash), and tests inject their own storage.
  */
 
+import {
+  classifyStorageError,
+  storageErrorMessage,
+  writeStoredValue,
+  type StorageOutcome,
+} from "./versionedStorage.ts";
 import { NETWORK } from "./network.ts";
 
+export type TxHistoryTerminalOutcome =
+  "confirmed" | "failed" | "cancelled" | "pre-submit-failure" | "submitted";
+
+export type TxHistoryStatus = TxHistoryTerminalOutcome;
+
 export interface TxHistoryEntry {
-  /** The hash the network accepted. Identity for de-duplication. */
-  hash: string;
+  /** The hash the network accepted. Identity for de-duplication (null for cancelled/pre-submit failure). */
+  hash: string | null;
+  /** Stable local identity for rows without a hash or for React keys. */
+  id?: string;
   /** The contract function or host operation that was submitted. */
   operation: string;
-  status: "confirmed" | "failed";
+  status: TxHistoryStatus;
   /** Total fee paid, in stroops (inclusion + resource), as a decimal string. */
   feeStroops: string | null;
   /** Network identity captured when this console recorded the write. */
@@ -29,6 +42,8 @@ export interface TxHistoryEntry {
   networkPassphrase: string | null;
   /** ISO 8601 timestamp of when this console recorded the outcome. */
   recordedAt: string;
+  /** Actionable error or cancellation detail. */
+  detail?: string | null;
 }
 
 export type TxVerificationStatus = "pending" | "not-found" | "confirmed" | "failed";
@@ -57,12 +72,40 @@ export function txHistoryMatchesNetwork(entry: TxHistoryEntry, networkPassphrase
 /** Maximum entries kept — the oldest beyond this are dropped. */
 export const TX_HISTORY_LIMIT = 200;
 
+/** Maximum age for local transaction history records (in days). Records older than this are pruned. */
+export const TX_HISTORY_MAX_AGE_DAYS = 30;
+export const TX_HISTORY_MAX_AGE_MS = TX_HISTORY_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
+
+export interface PruneOptions {
+  maxCount?: number;
+  maxAgeMs?: number;
+  now?: number;
+}
+
+/** Evict records past the documented retention boundaries (max age and max count) deterministically. */
+export function pruneTxHistory(
+  entries: TxHistoryEntry[],
+  options?: PruneOptions,
+): TxHistoryEntry[] {
+  const maxCount = options?.maxCount ?? TX_HISTORY_LIMIT;
+  const maxAgeMs = options?.maxAgeMs ?? TX_HISTORY_MAX_AGE_MS;
+  const now = options?.now ?? Date.now();
+  const cutoffIso = new Date(now - maxAgeMs).toISOString();
+
+  return entries.filter((entry) => entry.recordedAt >= cutoffIso).slice(0, maxCount);
+}
+
 export const TX_HISTORY_STORAGE_KEY = "stellar-agent-guard-dashboard.txHistory.v1";
+
+let lastSaveOutcome: StorageOutcome<void> = { ok: true, value: undefined };
+let memoryHistory: TxHistoryEntry[] = [];
+const failedStores = new WeakSet<object>();
 
 /** The subset of `Storage` the store needs, so tests can inject a fake. */
 export interface StorageLike {
   getItem(key: string): string | null;
   setItem(key: string, value: string): void;
+  removeItem?(key: string): void;
 }
 
 function defaultStorage(): StorageLike | null {
@@ -75,13 +118,22 @@ function defaultStorage(): StorageLike | null {
   }
 }
 
+const VALID_STATUSES = new Set<string>([
+  "confirmed",
+  "failed",
+  "cancelled",
+  "pre-submit-failure",
+  "submitted",
+]);
+
 function isEntry(value: unknown): value is TxHistoryEntry {
   if (typeof value !== "object" || value === null) return false;
   const entry = value as Partial<TxHistoryEntry>;
   return (
-    typeof entry.hash === "string" &&
+    (entry.hash === null || typeof entry.hash === "string" || entry.hash === undefined) &&
     typeof entry.operation === "string" &&
-    (entry.status === "confirmed" || entry.status === "failed") &&
+    typeof entry.status === "string" &&
+    VALID_STATUSES.has(entry.status) &&
     typeof entry.recordedAt === "string" &&
     (entry.networkName === undefined ||
       entry.networkName === null ||
@@ -91,33 +143,61 @@ function isEntry(value: unknown): value is TxHistoryEntry {
       typeof entry.networkPassphrase === "string") &&
     (entry.feeStroops === null ||
       entry.feeStroops === undefined ||
-      typeof entry.feeStroops === "string")
+      typeof entry.feeStroops === "string") &&
+    (entry.detail === undefined || entry.detail === null || typeof entry.detail === "string")
   );
 }
 
 /**
- * The stored history, newest first, validated and capped. A corrupted
+ * The stored history, newest first, migrated and retention-pruned. A corrupted
  * payload yields an empty history rather than a broken dashboard.
  */
-export function loadTxHistory(storage: StorageLike | null = defaultStorage()): TxHistoryEntry[] {
-  if (!storage) return [];
+export function loadTxHistory(
+  storage?: StorageLike | null,
+  options?: PruneOptions,
+): TxHistoryEntry[] {
+  const store = storage === undefined ? defaultStorage() : storage;
+  if (!store) return [...memoryHistory];
+  if (failedStores.has(store)) return [...memoryHistory];
   try {
-    const raw = storage.getItem(TX_HISTORY_STORAGE_KEY);
+    const raw = store.getItem(TX_HISTORY_STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw) as unknown;
     if (!Array.isArray(parsed)) return [];
-    return parsed
-      .filter(isEntry)
-      .map((entry) => ({
-        ...entry,
-        feeStroops: entry.feeStroops ?? null,
-        networkName: entry.networkName ?? null,
-        networkPassphrase: entry.networkPassphrase ?? null,
-      }))
-      .slice(0, TX_HISTORY_LIMIT);
+    const migrated = parsed.filter(isEntry).map((entry) => ({
+      ...entry,
+      hash: entry.hash ?? null,
+      id: entry.id ?? (entry.hash ? entry.hash : `local-${entry.recordedAt}-${entry.operation}`),
+      feeStroops: entry.feeStroops ?? null,
+      networkName: entry.networkName ?? null,
+      networkPassphrase: entry.networkPassphrase ?? null,
+      detail: entry.detail ?? null,
+    }));
+    const pruned = pruneTxHistory(migrated, options);
+    memoryHistory = pruned;
+    return pruned;
   } catch {
     return [];
   }
+}
+
+/** Clear all local transaction records from browser storage. Does not affect on-chain state. */
+export function clearTxHistory(storage: StorageLike | null = defaultStorage()): void {
+  memoryHistory = [];
+  lastSaveOutcome = { ok: true, value: undefined };
+  if (storage) {
+    failedStores.delete(storage);
+    try {
+      if (typeof storage.removeItem === "function") {
+        storage.removeItem(TX_HISTORY_STORAGE_KEY);
+      } else {
+        storage.setItem(TX_HISTORY_STORAGE_KEY, JSON.stringify([]));
+      }
+    } catch (e) {
+      lastSaveOutcome = { ok: false, error: classifyStorageError(e) };
+    }
+  }
+  notify();
 }
 
 const listeners = new Set<() => void>();
@@ -130,43 +210,78 @@ export function subscribeTxHistory(listener: () => void): () => void {
   };
 }
 
+/** Persistence result for the latest history write, for a concise UI warning. */
+export function txHistorySaveOutcome(): StorageOutcome<void> {
+  return lastSaveOutcome;
+}
+
+export function txHistorySaveWarning(): string | null {
+  return lastSaveOutcome.ok ? null : storageErrorMessage(lastSaveOutcome.error);
+}
+
 function notify(): void {
   for (const listener of [...listeners]) listener();
 }
 
 /**
- * Record a submitted transaction, newest first.
+ * Record a submitted or terminal transaction outcome, newest first.
  *
- * Re-recording the same hash replaces the earlier entry (a transaction has
- * one identity; a later, better-informed outcome wins) and moves it to the
- * front. The list is capped at `TX_HISTORY_LIMIT`.
+ * Never assigns a transaction hash for requests cancelled before submission.
+ * Re-recording the same hash or id replaces the earlier entry and moves it to
+ * the front. The list is bounded by count and retention age.
  */
 export function recordTx(
-  entry: Pick<TxHistoryEntry, "hash" | "operation" | "status" | "feeStroops"> &
-    Partial<Pick<TxHistoryEntry, "recordedAt" | "networkName" | "networkPassphrase">>,
+  entry: {
+    hash: string | null;
+    operation: string;
+    status: TxHistoryStatus;
+    feeStroops?: string | null;
+    recordedAt?: string;
+    networkName?: string | null;
+    networkPassphrase?: string | null;
+    detail?: string | null;
+    id?: string;
+  },
   storage: StorageLike | null = defaultStorage(),
+  options?: PruneOptions,
 ): TxHistoryEntry[] {
+  const recordedAt = entry.recordedAt ?? new Date().toISOString();
+  const id =
+    entry.id ??
+    (entry.hash
+      ? entry.hash
+      : `local-${recordedAt}-${entry.operation}-${Math.random().toString(36).slice(2)}`);
   const recorded: TxHistoryEntry = {
-    hash: entry.hash,
+    hash: entry.hash ?? null,
+    id,
     operation: entry.operation,
     status: entry.status,
     feeStroops: entry.feeStroops ?? null,
     networkName: entry.networkName ?? NETWORK.name,
     networkPassphrase: entry.networkPassphrase ?? NETWORK.passphrase,
-    recordedAt: entry.recordedAt ?? new Date().toISOString(),
+    recordedAt,
+    detail: entry.detail ?? null,
   };
-  const current = loadTxHistory(storage);
-  const next = [recorded, ...current.filter((existing) => existing.hash !== recorded.hash)].slice(
-    0,
-    TX_HISTORY_LIMIT,
+  const current = loadTxHistory(storage, options);
+  const next = pruneTxHistory(
+    [
+      recorded,
+      ...current.filter((existing) => {
+        if (recorded.hash && existing.hash) {
+          return existing.hash !== recorded.hash;
+        }
+        if (recorded.id && existing.id) {
+          return existing.id !== recorded.id;
+        }
+        return true;
+      }),
+    ],
+    options,
   );
-  if (storage) {
-    try {
-      storage.setItem(TX_HISTORY_STORAGE_KEY, JSON.stringify(next));
-    } catch {
-      // A private-mode write failure must not interrupt the submission path.
-    }
-  }
+  memoryHistory = next;
+  lastSaveOutcome = writeStoredValue(storage, TX_HISTORY_STORAGE_KEY, JSON.stringify(next));
+  if (storage && !lastSaveOutcome.ok) failedStores.add(storage);
+  else if (storage) failedStores.delete(storage);
   notify();
   return next;
 }
@@ -192,7 +307,7 @@ export function filterTxHistory(
   return entries.filter((entry) => {
     if (query.length > 0) {
       const haystack =
-        `${entry.operation} ${entry.hash} ${entry.status} ${entry.networkName ?? ""} ${entry.networkPassphrase ?? ""}`.toLowerCase();
+        `${entry.operation} ${entry.hash ?? ""} ${entry.status} ${entry.networkName ?? ""} ${entry.networkPassphrase ?? ""} ${entry.detail ?? ""}`.toLowerCase();
       if (!haystack.includes(query)) return false;
     }
     const day = entry.recordedAt.slice(0, 10);
@@ -236,7 +351,7 @@ export function txHistoryToCsv(entries: TxHistoryEntry[]): string {
         entry.recordedAt,
         entry.operation,
         entry.status,
-        entry.hash,
+        entry.hash ?? "",
         entry.feeStroops ?? "",
         entry.networkName ?? "",
         entry.networkPassphrase ?? "",

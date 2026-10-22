@@ -69,3 +69,85 @@ test("responsive contract: the form actually uses the classes", async (t) => {
     assert.ok(sticky, "expected .form-actions { position: sticky; ... } outside the media block");
   });
 });
+
+/**
+ * Responsive table contract (#338).
+ *
+ * Same jsdom limitation as above: layout itself is not measured here. What is
+ * asserted is the contract that makes the narrow layout understandable — the
+ * semantic header cells are still real `<th scope="col">`, every data cell
+ * carries the row label that the stacked layout prints, and the stylesheet
+ * hides the header row visually (never semantically) while wrapping long
+ * addresses instead of clipping them.
+ */
+
+const fleetSource = readFileSync("components/FleetTable.tsx", "utf8");
+const telemetrySource = readFileSync("components/TelemetryFeed.tsx", "utf8");
+const historySource = readFileSync("components/TxHistoryTable.tsx", "utf8");
+
+const TABLES = [
+  { name: "FleetTable", source: fleetSource },
+  { name: "TelemetryFeed", source: telemetrySource },
+  { name: "TxHistoryTable", source: historySource },
+];
+
+test("responsive tables: headers stay semantic and rows carry their labels", async (t) => {
+  for (const table of TABLES) {
+    await t.test(`${table.name} declares every header cell as a column header`, () => {
+      const headers = table.source.match(/<th\b[^>]*>/g) ?? [];
+      assert.ok(headers.length > 0, "expected the table to render header cells");
+      for (const header of headers) {
+        assert.match(header, /scope="col"/, `unscoped header in ${table.name}: ${header}`);
+      }
+    });
+
+    await t.test(`${table.name} opts into the stacked layout`, () => {
+      assert.match(table.source, /events stack/);
+      assert.match(table.source, /className=/);
+      assert.match(table.source, /scrolly table-stack/);
+    });
+  }
+
+  await t.test("each data cell has a row label for the compact layout", () => {
+    const expected: Array<[string, string[]]> = [
+      ["FleetTable", ["Guard", "Network", "Status", "24h Spend", "DMS Countdown", "Actions"]],
+      ["TelemetryFeed", ["Event", "Decision", "Guard", "Source", "Time", "Transaction"]],
+      [
+        "TxHistoryTable",
+        ["Timestamp", "Operation", "Status", "Network", "Tx Hash", "Gas Fee", "Chain verification"],
+      ],
+    ];
+    for (const [name, labels] of expected) {
+      const source = TABLES.find((table) => table.name === name)!.source;
+      for (const label of labels) {
+        assert.match(
+          source,
+          new RegExp(`<td[^>]*data-label="${label}"`),
+          `${name} is missing data-label="${label}"`,
+        );
+      }
+    }
+  });
+
+  await t.test("stacked rules live inside the 720px media block", () => {
+    const block = mediaBlock("(max-width: 720px)");
+    assert.match(block, /table\.events\.stack thead\s*\{[^}]*position:\s*absolute/);
+    assert.match(block, /table\.events\.stack td::before\s*\{[^}]*content:\s*attr\(data-label\)/);
+    assert.match(block, /table\.events\.stack td\s*\{[^}]*overflow-wrap:\s*anywhere/);
+    assert.match(block, /table\.events\.stack td button\s*\{[^}]*min-height:\s*32px/);
+    assert.match(block, /\.scrolly\.table-stack\s*\{[^}]*max-height:\s*none/);
+    assert.match(block, /table\.events\.stack td \.row\s*\{[^}]*flex-wrap:\s*wrap/);
+  });
+
+  await t.test("key actions stay reachable without horizontal overlap", () => {
+    // The fleet table's Inspect/Freeze pair and the history verification
+    // controls live in cells that wrap; the stacked row is a block, so the
+    // buttons cannot be pushed off-screen by a long address.
+    const block = mediaBlock("(max-width: 720px)");
+    assert.match(fleetSource, /flexWrap:\s*"wrap"/);
+    assert.match(
+      block,
+      /table\.events\.stack tr,\s*table\.events\.stack td\s*\{[^}]*display:\s*block/,
+    );
+  });
+});

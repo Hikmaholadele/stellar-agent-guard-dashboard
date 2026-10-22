@@ -1083,6 +1083,17 @@ export function GuardProvider({
     enabled: wallet !== null,
     onExpire: handleIdleExpire,
   });
+  const idleWarningRef = useRef<HTMLDivElement>(null);
+  const stayConnectedRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (idleState.phase === "warning" && wallet) idleWarningRef.current?.focus();
+  }, [idleState.phase, wallet]);
+  useEffect(() => {
+    const seconds = idleState.secondsLeft;
+    if (idleState.phase === "warning" && wallet && (seconds <= 10 || seconds % 10 === 0)) {
+      announce(`Session expires in ${seconds} seconds`);
+    }
+  }, [idleState.phase, idleState.secondsLeft, wallet]);
   const setIdleTimeout = useCallback((valueMs: number) => {
     saveIdleTimeoutMs(valueMs);
     setIdleTimeoutMs(valueMs);
@@ -1280,7 +1291,14 @@ export function GuardProvider({
               aria-modal="true"
               aria-labelledby="session-lock-title"
               aria-describedby="session-lock-body"
+              ref={idleWarningRef}
               tabIndex={-1}
+              onKeyDown={(event) => {
+                if (event.key === "Tab") {
+                  event.preventDefault();
+                  stayConnectedRef.current?.focus();
+                }
+              }}
             >
               <strong id="session-lock-title">
                 Session expiring due to inactivity. Click to stay connected.
@@ -1291,7 +1309,9 @@ export function GuardProvider({
                 signed again.
               </p>
               <div className="row">
-                <button onClick={stayConnected}>Stay connected</button>
+                <button ref={stayConnectedRef} onClick={stayConnected}>
+                  Stay connected
+                </button>
               </div>
             </div>
           </div>

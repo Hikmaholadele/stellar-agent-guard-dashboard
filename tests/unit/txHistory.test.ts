@@ -5,12 +5,17 @@ import { GuardContext, type GuardContextValue } from "../../components/GuardProv
 import { TxHistoryTable } from "../../components/TxHistoryTable.tsx";
 import {
   TX_HISTORY_LIMIT,
+  TX_HISTORY_MAX_AGE_DAYS,
+  TX_HISTORY_MAX_AGE_MS,
   TX_HISTORY_STORAGE_KEY,
+  clearTxHistory,
   filterTxHistory,
   loadTxHistory,
   paginateTxHistory,
+  pruneTxHistory,
   recordTx,
   subscribeTxHistory,
+  txHistorySaveOutcome,
   txHistoryMatchesNetwork,
   txHistoryToCsv,
   txVerificationStatus,
@@ -136,6 +141,21 @@ test("a corrupt or non-array storage payload yields an empty history", () => {
     JSON.stringify([entry(), { hash: "broken", status: "weird" }]),
   );
   assert.equal(loadTxHistory(storage).length, 1);
+});
+
+test("a quota failure is reported without interrupting the in-memory history result", () => {
+  const storage: StorageLike = {
+    getItem: () => null,
+    setItem: () => {
+      throw Object.assign(new Error("full"), { name: "QuotaExceededError" });
+    },
+  };
+  const result = recordTx(
+    { hash: "still-recorded", operation: "freeze", status: "confirmed", feeStroops: null },
+    storage,
+  );
+  assert.equal(result[0]?.hash, "still-recorded");
+  assert.deepEqual(txHistorySaveOutcome(), { ok: false, error: "quota" });
 });
 
 test("legacy history rows load with unknown network provenance", () => {
@@ -336,4 +356,91 @@ test("CSV export has a fixed header and one quoted row per entry", () => {
     lines[2],
     `"2026-09-24T11:00:00.000Z","odd ""operation""","failed","h2","","${NETWORK.name}","${NETWORK.passphrase}"`,
   );
+});
+
+test("retention boundary: prunes records older than 30 days deterministically", () => {
+  const now = new Date("2026-10-20T12:00:00.000Z").getTime();
+  const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+
+  const entries: TxHistoryEntry[] = [
+    entry({ hash: "recent", recordedAt: new Date(now - 1000).toISOString() }),
+    entry({ hash: "boundary-ok", recordedAt: new Date(now - thirtyDaysMs + 5000).toISOString() }),
+    entry({
+      hash: "boundary-expired",
+      recordedAt: new Date(now - thirtyDaysMs - 5000).toISOString(),
+    }),
+    entry({ hash: "old", recordedAt: new Date(now - 40 * 24 * 60 * 60 * 1000).toISOString() }),
+  ];
+
+  const pruned = pruneTxHistory(entries, { now });
+  assert.equal(pruned.length, 2);
+  assert.equal(pruned[0]?.hash, "recent");
+  assert.equal(pruned[1]?.hash, "boundary-ok");
+});
+
+test("clearTxHistory clears local storage and memory and notifies subscribers", () => {
+  const storage = fakeStorage();
+  recordTx({ hash: "h1", operation: "freeze", status: "confirmed", feeStroops: null }, storage);
+  assert.equal(loadTxHistory(storage).length, 1);
+
+  let notified = 0;
+  const unsubscribe = subscribeTxHistory(() => {
+    notified += 1;
+  });
+
+  clearTxHistory(storage);
+  unsubscribe();
+
+  assert.equal(loadTxHistory(storage).length, 0);
+  assert.equal(notified, 1);
+});
+
+test("TxHistoryTable confirmation dialog warns that clearing local data does not change the chain", async () => {
+  localStorage.setItem(
+    TX_HISTORY_STORAGE_KEY,
+    JSON.stringify([entry({ hash: "tx-to-clear", status: "confirmed" })]),
+  );
+
+  const server = {
+    getTransaction: async () => ({ status: "SUCCESS" }),
+  };
+
+  const div = document.createElement("div");
+  document.body.appendChild(div);
+  root = createRoot(div);
+  await act(async () => {
+    root!.render(
+      React.createElement(
+        GuardContext.Provider,
+        { value: { server } as unknown as GuardContextValue },
+        React.createElement(TxHistoryTable),
+      ),
+    );
+  });
+
+  assert.ok(div.textContent?.includes("tx-to-clear"));
+
+  // Click clear button
+  const clearBtn = div.querySelector(
+    'button[data-testid="clear-history-button"]',
+  ) as HTMLButtonElement;
+  assert.ok(clearBtn);
+  await act(async () => clearBtn.click());
+
+  // Confirm dialog should appear stating that on-chain records are unchanged
+  assert.ok(div.textContent?.includes("Clear browser-local transaction history?"));
+  assert.ok(
+    div.textContent?.includes("On-chain transactions and ledger state are completely unchanged"),
+  );
+
+  // Click confirm
+  const confirmBtn = div.querySelector(
+    'button[data-testid="confirm-clear-history-button"]',
+  ) as HTMLButtonElement;
+  assert.ok(confirmBtn);
+  await act(async () => confirmBtn.click());
+
+  // History should now be empty in table and in storage
+  assert.equal(loadTxHistory().length, 0);
+  assert.ok(div.textContent?.includes("No transactions have been submitted from this console yet"));
 });

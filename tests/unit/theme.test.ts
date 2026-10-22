@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test, before, afterEach } from "node:test";
 import { installDom, loadReact } from "./domHarness.ts";
 import { ThemeProvider, useTheme } from "../../components/ThemeProvider.tsx";
@@ -135,4 +136,81 @@ test("listens to media query changes if no localStorage set", async () => {
   });
 
   assert.equal(document.documentElement.getAttribute("data-theme"), "light");
+});
+
+/**
+ * Reduced-motion contract (#339).
+ *
+ * The behaviour is a stylesheet contract: when the OS preference is on, every
+ * animation and transition is reduced to its end state; when it is absent, the
+ * normal motion is untouched. jsdom has no media-query engine, so the rules
+ * themselves are the artifact under test.
+ */
+
+const reducedMotionBlocks = (() => {
+  const sheet = readFileSync("app/globals.css", "utf8");
+  const blocks: string[] = [];
+  const marker = "@media (prefers-reduced-motion: reduce)";
+  let from = 0;
+  for (;;) {
+    const start = sheet.indexOf(marker, from);
+    if (start < 0) break;
+    let depth = 0;
+    let i = sheet.indexOf("{", start);
+    for (; i < sheet.length; i++) {
+      if (sheet[i] === "{") depth += 1;
+      if (sheet[i] === "}") {
+        depth -= 1;
+        if (depth === 0) break;
+      }
+    }
+    blocks.push(sheet.slice(start, i + 1));
+    from = i + 1;
+  }
+  return blocks;
+})();
+
+test("reduced motion: a single rule disables non-essential movement", () => {
+  const combined = reducedMotionBlocks.join("\n");
+  assert.ok(combined.length > 0, "expected a prefers-reduced-motion block");
+  assert.match(
+    combined,
+    /\*,\s*\*::before,\s*\*::after\s*\{[^}]*animation-duration:\s*0\.001ms\s*!important/,
+  );
+  assert.match(
+    combined,
+    /\*,\s*\*::before,\s*\*::after\s*\{[^}]*transition-duration:\s*0\.001ms\s*!important/,
+  );
+  assert.match(
+    combined,
+    /\*,\s*\*::before,\s*\*::after\s*\{[^}]*animation-iteration-count:\s*1\s*!important/,
+  );
+  assert.match(combined, /scroll-behavior:\s*auto\s*!important/);
+});
+
+test("reduced motion: end states still apply, so state changes stay visible", () => {
+  const combined = reducedMotionBlocks.join("\n");
+  // Duration is clamped, not removed: a status banner or toast still reaches
+  // its final styling instead of animating and disappearing with the frame.
+  assert.equal(/animation:\s*none\s*!important/.test(combined), false);
+  assert.equal(/transition:\s*none\s*!important/.test(combined), false);
+});
+
+test("reduced motion: normal motion is unchanged when the preference is absent", () => {
+  const sheet = readFileSync("app/globals.css", "utf8");
+  assert.match(sheet, /\.toast-enter\s*\{[^}]*animation:\s*toast-in/);
+  assert.match(sheet, /\.skeleton\s*\{[^}]*animation:\s*skeleton-shimmer/);
+  assert.match(sheet, /\.sim-bar::after\s*\{[^}]*transition:\s*width/);
+});
+
+test("reduced motion: status is still readable as text, not only as colour or motion", () => {
+  const feed = readFileSync("components/TelemetryFeed.tsx", "utf8");
+  // The feed row carries its tier as text as well as via the row class, and the
+  // decision cell states blocked/allowed in words.
+  assert.match(feed, /Severity: \{severity\}/);
+  assert.match(feed, />allowed</);
+  assert.match(feed, /event\.decision\.reason/);
+  // Panels are static sections with no animation of their own to lose.
+  const grid = readFileSync("components/DashboardGrid.tsx", "utf8");
+  assert.equal(/animation/.test(grid), false);
 });

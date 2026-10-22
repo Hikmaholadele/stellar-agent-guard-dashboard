@@ -24,6 +24,8 @@
 /** The channel and storage key name. Versioned so a shape change cannot be misread. */
 export const TAB_SYNC_CHANNEL = "stellar-agent-guard-dashboard.tab-sync.v1";
 export const TAB_SYNC_STORAGE_KEY = "stellar-agent-guard-dashboard.tab-sync.v1";
+export const GUARD_WRITE_LOCK_TTL_MS = 120_000;
+const GUARD_WRITE_LOCK_PREFIX = "stellar-agent-guard-dashboard.guard-write.v1";
 
 /**
  * The state changes that are worth telling the other tabs about.
@@ -95,6 +97,10 @@ export interface TabStorage {
   setItem(key: string, value: string): void;
 }
 
+export interface GuardWriteStorage extends TabStorage {
+  removeItem(key: string): void;
+}
+
 /** A `storage` event, narrowed to the two fields the fallback reads. */
 export interface TabStorageEvent {
   key: string | null;
@@ -106,6 +112,46 @@ export interface TabEventTarget {
   addEventListener(type: "storage", listener: (event: TabStorageEvent) => void): void;
   removeEventListener(type: "storage", listener: (event: TabStorageEvent) => void): void;
 }
+
+export interface TabLifecycleTarget {
+  addEventListener(type: "pagehide", listener: () => void): void;
+  removeEventListener(type: "pagehide", listener: () => void): void;
+}
+
+export interface GuardWriteLockRecord {
+  guard: string;
+  action: "freeze" | "unfreeze";
+  network: string;
+  owner: string;
+  expiresAt: number;
+}
+
+export interface GuardWriteLockLease {
+  readonly record: GuardWriteLockRecord;
+  renew(): boolean;
+  release(): void;
+}
+
+export interface GuardWriteLockOptions {
+  storage?: GuardWriteStorage | null;
+  eventTarget?: TabEventTarget | null;
+  lifecycleTarget?: TabLifecycleTarget | null;
+  now?: () => number;
+  randomId?: () => string;
+  ttlMs?: number;
+}
+
+export interface GuardWriteLockScope {
+  guard: string;
+  action: GuardWriteLockRecord["action"];
+  network: string;
+}
+
+const inMemoryGuardWriteLocks = new Map<string, GuardWriteLockRecord>();
+const guardWriteLockListeners = new Map<
+  string,
+  Set<(record: GuardWriteLockRecord | null) => void>
+>();
 
 export interface TabSyncOptions {
   channelName?: string;
@@ -176,6 +222,182 @@ function defaultStorage(): TabStorage | null {
 function defaultEventTarget(): TabEventTarget | null {
   if (typeof window === "undefined") return null;
   return window as unknown as TabEventTarget;
+}
+
+function defaultLifecycleTarget(): TabLifecycleTarget | null {
+  if (typeof window === "undefined") return null;
+  return window as unknown as TabLifecycleTarget;
+}
+
+function guardWriteLockKey(scope: GuardWriteLockScope): string {
+  return `${GUARD_WRITE_LOCK_PREFIX}.${encodeURIComponent(scope.network)}.${encodeURIComponent(
+    scope.guard,
+  )}.${scope.action}`;
+}
+
+function isGuardWriteLockRecord(value: unknown): value is GuardWriteLockRecord {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Partial<GuardWriteLockRecord>;
+  return (
+    typeof record.guard === "string" &&
+    (record.action === "freeze" || record.action === "unfreeze") &&
+    typeof record.network === "string" &&
+    typeof record.owner === "string" &&
+    typeof record.expiresAt === "number" &&
+    Number.isFinite(record.expiresAt)
+  );
+}
+
+function storageForGuardWrite(options: GuardWriteLockOptions): GuardWriteStorage | null {
+  if (options.storage !== undefined) return options.storage;
+  return defaultStorage() as GuardWriteStorage | null;
+}
+
+function readGuardWriteLock(
+  key: string,
+  now: number,
+  storage: GuardWriteStorage | null,
+): GuardWriteLockRecord | null {
+  if (!storage) {
+    const record = inMemoryGuardWriteLocks.get(key);
+    if (record && record.expiresAt > now) return record;
+    inMemoryGuardWriteLocks.delete(key);
+    return null;
+  }
+
+  try {
+    const raw = storage.getItem(key);
+    if (raw === null) return null;
+    const value: unknown = JSON.parse(raw);
+    if (!isGuardWriteLockRecord(value) || value.expiresAt <= now) {
+      storage.removeItem(key);
+      return null;
+    }
+    return value;
+  } catch {
+    return null;
+  }
+}
+
+function notifyGuardWriteLockListeners(key: string, record: GuardWriteLockRecord | null): void {
+  for (const listener of [...(guardWriteLockListeners.get(key) ?? [])]) listener(record);
+}
+
+/**
+ * Claim one guard/action in this tab and, when localStorage is available, share
+ * the short-lived claim with other tabs. The lease coordinates operator intent;
+ * it is not a chain lock and never replaces a live read or simulation.
+ */
+export function acquireGuardWriteLock(
+  scope: GuardWriteLockScope,
+  options: GuardWriteLockOptions = {},
+): GuardWriteLockLease | null {
+  const key = guardWriteLockKey(scope);
+  const storage = storageForGuardWrite(options);
+  const now = options.now ?? Date.now;
+  const ttlMs = options.ttlMs ?? GUARD_WRITE_LOCK_TTL_MS;
+  const owner = (options.randomId ?? defaultRandomId)();
+  if (readGuardWriteLock(key, now(), storage) !== null) return null;
+
+  const record: GuardWriteLockRecord = {
+    ...scope,
+    owner,
+    expiresAt: now() + ttlMs,
+  };
+  const write = (next: GuardWriteLockRecord): boolean => {
+    if (!storage) {
+      inMemoryGuardWriteLocks.set(key, next);
+      return true;
+    }
+    try {
+      storage.setItem(key, JSON.stringify(next));
+      return readGuardWriteLock(key, now(), storage)?.owner === owner;
+    } catch {
+      inMemoryGuardWriteLocks.set(key, next);
+      return true;
+    }
+  };
+
+  if (!write(record)) return null;
+  notifyGuardWriteLockListeners(key, record);
+
+  let released = false;
+  const lifecycleTarget =
+    options.lifecycleTarget === undefined ? defaultLifecycleTarget() : options.lifecycleTarget;
+  const onPageHide = (): void => lease.release();
+  const lease: GuardWriteLockLease = {
+    get record() {
+      return record;
+    },
+    renew() {
+      if (released) return false;
+      const current = readGuardWriteLock(key, now(), storage);
+      if (current?.owner !== owner) return false;
+      record.expiresAt = now() + ttlMs;
+      if (!write(record)) return false;
+      notifyGuardWriteLockListeners(key, record);
+      return true;
+    },
+    release() {
+      if (released) return;
+      released = true;
+      lifecycleTarget?.removeEventListener("pagehide", onPageHide);
+      const current = readGuardWriteLock(key, now(), storage);
+      if (current?.owner === owner) {
+        if (storage) {
+          try {
+            storage.removeItem(key);
+          } catch {
+            inMemoryGuardWriteLocks.delete(key);
+          }
+        } else {
+          inMemoryGuardWriteLocks.delete(key);
+        }
+      }
+      inMemoryGuardWriteLocks.delete(key);
+      notifyGuardWriteLockListeners(key, null);
+    },
+  };
+  lifecycleTarget?.addEventListener("pagehide", onPageHide);
+  return lease;
+}
+
+/** Listen for this scope's active claim, including a claim made before subscribe. */
+export function subscribeGuardWriteLock(
+  scope: GuardWriteLockScope,
+  listener: (record: GuardWriteLockRecord | null) => void,
+  options: GuardWriteLockOptions = {},
+): () => void {
+  const key = guardWriteLockKey(scope);
+  const storage = storageForGuardWrite(options);
+  const now = options.now ?? Date.now;
+  const eventTarget =
+    options.eventTarget === undefined ? defaultEventTarget() : options.eventTarget;
+  const listeners = guardWriteLockListeners.get(key) ?? new Set();
+  listeners.add(listener);
+  guardWriteLockListeners.set(key, listeners);
+
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const publish = (): void => {
+    if (timer !== null) clearTimeout(timer);
+    const record = readGuardWriteLock(key, now(), storage);
+    listener(record);
+    if (record) {
+      timer = setTimeout(publish, Math.max(0, record.expiresAt - now() + 1));
+    }
+  };
+  const onStorage = (event: TabStorageEvent): void => {
+    if (event.key === key) publish();
+  };
+  eventTarget?.addEventListener("storage", onStorage);
+  publish();
+
+  return () => {
+    if (timer !== null) clearTimeout(timer);
+    eventTarget?.removeEventListener("storage", onStorage);
+    listeners.delete(listener);
+    if (listeners.size === 0) guardWriteLockListeners.delete(key);
+  };
 }
 
 // ── Shared coordinator shell ───────────────────────────────────────────────

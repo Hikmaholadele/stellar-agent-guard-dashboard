@@ -15,6 +15,11 @@
  */
 
 import { NETWORK, PHASE1_ARTIFACT } from "./network.ts";
+import {
+  decodeVersionedRecord,
+  encodeVersionedRecord,
+  writeStoredValue,
+} from "./versionedStorage.ts";
 
 export interface GuardInstance {
   guard: string;
@@ -80,6 +85,9 @@ export const KNOWN_INSTANCES: readonly GuardInstance[] = [
 
 /** The versioned storage key: one saved-guard list per network. */
 export const INSTANCE_STORAGE_PREFIX = "stellar-agent-guard-dashboard.instances.v2";
+export const INSTANCE_REGISTRY_SCHEMA = "stellar-agent-guard/instance-registry";
+export const INSTANCE_REGISTRY_VERSION = 2;
+const UNKNOWN_ADDED_AT = "1970-01-01T00:00:00.000Z";
 
 /** The namespaced storage key for a network's saved-guard list. */
 export function instanceStorageKey(network: string): string {
@@ -151,7 +159,7 @@ export function defaultGuard(): string {
 }
 
 /** Coerce an untrusted stored entry into a `GuardInstance`, or reject it. */
-function asInstance(value: unknown, network: string, now: () => string): GuardInstance | null {
+function asInstance(value: unknown, network: string): GuardInstance | null {
   if (typeof value !== "object" || value === null) return null;
   const entry = value as Partial<GuardInstance>;
   if (typeof entry.guard !== "string" || !looksLikeContractAddress(entry.guard)) return null;
@@ -163,7 +171,8 @@ function asInstance(value: unknown, network: string, now: () => string): GuardIn
         : defaultGuardLabel(entry.guard),
     // A v1 entry has no network; it belongs to the network this build runs on.
     network: typeof entry.network === "string" && entry.network !== "" ? entry.network : network,
-    addedAt: typeof entry.addedAt === "string" && entry.addedAt !== "" ? entry.addedAt : now(),
+    addedAt:
+      typeof entry.addedAt === "string" && entry.addedAt !== "" ? entry.addedAt : UNKNOWN_ADDED_AT,
     provenance:
       typeof entry.provenance === "string" && entry.provenance !== ""
         ? entry.provenance
@@ -171,36 +180,61 @@ function asInstance(value: unknown, network: string, now: () => string): GuardIn
   };
 }
 
-function parseList(raw: string | null, network: string): GuardInstance[] | null {
-  if (raw === null) return null;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    // A corrupted entry must not stop the dashboard from loading; the known
-    // instances are always available.
-    return [];
-  }
-  if (!Array.isArray(parsed)) return [];
-  const now = () => new Date().toISOString();
+function parseList(raw: string, network: string) {
+  const decoded = decodeVersionedRecord({
+    raw,
+    schema: INSTANCE_REGISTRY_SCHEMA,
+    version: INSTANCE_REGISTRY_VERSION,
+    migrations: { 0: (value) => value, 1: (value) => value },
+    validate: (value): value is unknown[] => Array.isArray(value),
+  });
+  if (!decoded.ok) return decoded;
+  const parsed = decoded.value;
   const seen = new Set<string>();
   const out: GuardInstance[] = [];
+  let migrationSafe = true;
   for (const entry of parsed) {
-    const instance = asInstance(entry, network, now);
-    if (!instance || seen.has(instance.guard)) continue;
+    const instance = asInstance(entry, network);
+    if (!instance) {
+      migrationSafe = false;
+      continue;
+    }
+    if (seen.has(instance.guard)) continue;
     seen.add(instance.guard);
     out.push(instance);
   }
-  return out.slice(0, INSTANCE_LIMIT);
+  return {
+    ok: true,
+    value: out.slice(0, INSTANCE_LIMIT),
+    needsMigration: decoded.needsMigration,
+    migrationSafe,
+  };
 }
 
-/** The namespaced stored list, or `null` when the key has never been written. */
-function readNamespaced(network: string, storage: StorageLike | null): GuardInstance[] | null {
-  if (!storage) return null;
+type StoredList =
+  | { kind: "missing" }
+  | { kind: "invalid" }
+  | { kind: "valid"; instances: GuardInstance[]; migrationSafe: boolean };
+
+/** The namespaced stored list, preserving invalid and future-version values. */
+function readNamespaced(network: string, storage: StorageLike | null): StoredList {
+  if (!storage) return { kind: "missing" };
   try {
-    return parseList(storage.getItem(instanceStorageKey(network)), network);
+    const key = instanceStorageKey(network);
+    const raw = storage.getItem(key);
+    if (raw === null) return { kind: "missing" };
+    const parsed = parseList(raw, network);
+    if (!parsed.ok) return { kind: "invalid" };
+    if (parsed.needsMigration && parsed.migrationSafe) {
+      writeStoredValue(
+        storage,
+        key,
+        encodeVersionedRecord(INSTANCE_REGISTRY_SCHEMA, INSTANCE_REGISTRY_VERSION, parsed.value),
+      );
+    }
+    return { kind: "valid", instances: parsed.value, migrationSafe: parsed.migrationSafe };
   } catch {
-    return null;
+    return { kind: "invalid" };
   }
 }
 
@@ -208,13 +242,12 @@ function writeNamespaced(
   network: string,
   storage: StorageLike | null,
   instances: GuardInstance[],
-): void {
-  if (!storage) return;
-  try {
-    storage.setItem(instanceStorageKey(network), JSON.stringify(instances));
-  } catch {
-    // Private-mode storage failures are not worth interrupting the operator for.
-  }
+): boolean {
+  return writeStoredValue(
+    storage,
+    instanceStorageKey(network),
+    encodeVersionedRecord(INSTANCE_REGISTRY_SCHEMA, INSTANCE_REGISTRY_VERSION, instances),
+  ).ok;
 }
 
 /**
@@ -229,14 +262,24 @@ function writeNamespaced(
  */
 function migrateLegacy(storage: StorageLike | null): void {
   if (!storage) return;
-  let legacy: GuardInstance[] | null;
+  let raw: string | null;
   try {
-    legacy = parseList(storage.getItem(LEGACY_INSTANCE_STORAGE_KEY), NETWORK.name);
+    raw = storage.getItem(LEGACY_INSTANCE_STORAGE_KEY);
   } catch {
-    legacy = null;
+    return;
   }
-  if (legacy === null || legacy.length === 0) return;
-  writeNamespaced(NETWORK.name, storage, legacy);
+  if (raw === null) return;
+  const parsed = decodeVersionedRecord({
+    raw,
+    schema: INSTANCE_REGISTRY_SCHEMA,
+    version: INSTANCE_REGISTRY_VERSION,
+    migrations: { 0: (value) => value, 1: (value) => value },
+    validate: (value): value is unknown[] => Array.isArray(value),
+  });
+  if (!parsed.ok) return;
+  const legacy = parseList(JSON.stringify(parsed.value), NETWORK.name);
+  if (!legacy.ok || !legacy.migrationSafe || legacy.value.length === 0) return;
+  if (!writeNamespaced(NETWORK.name, storage, legacy.value)) return;
   try {
     storage.removeItem?.(LEGACY_INSTANCE_STORAGE_KEY);
   } catch {
@@ -247,9 +290,11 @@ function migrateLegacy(storage: StorageLike | null): void {
 /** The stored list for a network, running the one-time v1 migration if needed. */
 function readStored(network: string, storage: StorageLike | null): GuardInstance[] {
   const namespaced = readNamespaced(network, storage);
-  if (namespaced !== null) return namespaced;
+  if (namespaced.kind === "valid") return namespaced.instances;
+  if (namespaced.kind === "invalid") return [];
   migrateLegacy(storage);
-  return readNamespaced(network, storage) ?? [];
+  const migrated = readNamespaced(network, storage);
+  return migrated.kind === "valid" ? migrated.instances : [];
 }
 
 /** Instances the operator has added, plus the known ones, de-duplicated by address. */

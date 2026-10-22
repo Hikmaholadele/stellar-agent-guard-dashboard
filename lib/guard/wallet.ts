@@ -117,6 +117,11 @@ async function getNetworkPassphrase(): Promise<{ network: string; passphrase: st
 export function freighterSigner(address: string, networkPassphrase: string): WalletSigner {
   return {
     address,
+    // Freighter answers `getAddress` silently once access was granted, so the
+    // write path can re-check who is active without raising a prompt (#340).
+    // `null` means the extension is gone, which submit.ts treats as a
+    // recoverable disconnect rather than an unreviewed signature (#341).
+    currentAddress: () => currentAddress(),
     async signTransaction(transactionXdr: string): Promise<string> {
       const { signTransaction } = await freighter();
       const result = await signTransaction(transactionXdr, { networkPassphrase, address });

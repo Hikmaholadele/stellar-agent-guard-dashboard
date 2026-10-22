@@ -4,6 +4,7 @@ import { installDom, loadReact } from "../unit/domHarness.ts";
 import { PanicPanel } from "../../components/PanicPanel.tsx";
 import { GuardContext, type GuardContextValue } from "../../components/GuardProvider.tsx";
 import type { InvokeResult } from "../../lib/guard/submit.ts";
+import { acquireGuardWriteLock } from "../../lib/guard/tabSync.ts";
 
 describe("PanicPanel", () => {
   let dom: ReturnType<typeof installDom>;
@@ -127,6 +128,37 @@ describe("PanicPanel", () => {
     assert.dom(document.body).containsText("Export Unfreeze XDR");
     // Should not show confirmation dialog initially
     assert.dom(document.body).doesNotContainText("Confirm the freeze");
+  });
+
+  test("disables freeze and shows the pending operation from another tab", async () => {
+    const lease = acquireGuardWriteLock({
+      guard: "test_guard",
+      action: "freeze",
+      network: "Testnet",
+    });
+    assert.ok(lease);
+    const div = document.createElement("div");
+    document.body.appendChild(div);
+    root = createRoot(div);
+
+    await act(async () => {
+      root!.render(
+        React.createElement(
+          GuardContext.Provider,
+          { value: createMockGuardContextValue() },
+          React.createElement(PanicPanel),
+        ),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+
+    const freezeButton = [...document.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("Freeze pending"),
+    );
+    assert.ok(freezeButton);
+    assert.equal(freezeButton.disabled, true);
+    assert.ok(document.body.textContent?.includes("in another dashboard tab."));
+    lease.release();
   });
 
   test("shows confirmation dialog when freeze button clicked", async () => {

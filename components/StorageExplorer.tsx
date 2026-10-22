@@ -25,7 +25,7 @@
  * `lib/guard/chain.ts` and `lib/guard/storage.ts`; this file is the view.
  */
 
-import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import type { Dispatch } from "react";
 import { useGuard } from "./GuardProvider.tsx";
 import { CopyButton } from "./CopyButton.tsx";
@@ -33,16 +33,20 @@ import { ErrorBlock, Skeleton } from "./bits.tsx";
 import { readContractStorage } from "../lib/guard/chain.ts";
 import {
   INITIAL_EXPLORER_STATE,
+  clearOperatorStorageCategory,
   explorerReducer,
+  getOperatorStorageCategories,
   summarizeEntries,
   visibleEntries,
   type ExplorerAction,
   type ExplorerState,
   type JsonNode,
+  type OperatorStorageCategoryInfo,
   type StorageDurability,
   type StorageEntryView,
 } from "../lib/guard/storage.ts";
 import { announce } from "../lib/guard/useAnnounce.ts";
+import { STORAGE_INVENTORY } from "../lib/guard/storageInventory.ts";
 
 /** The badge class for a TTL tier — the tokens the rest of the interface uses. */
 const TIER_CLASS: Record<StorageEntryView["ttlTier"], string> = {
@@ -358,6 +362,11 @@ export function StorageExplorer({
  */
 export function StorageExplorerButton() {
   const [state, dispatch] = useReducer(explorerReducer, INITIAL_EXPLORER_STATE);
+  const [inventoryOpen, setInventoryOpen] = useState(false);
+  const [categories, setCategories] = useState<OperatorStorageCategoryInfo[]>(() =>
+    typeof window !== "undefined" ? getOperatorStorageCategories() : [],
+  );
+  const [confirmCategory, setConfirmCategory] = useState<OperatorStorageCategoryInfo | null>(null);
 
   return (
     <>
@@ -376,6 +385,148 @@ export function StorageExplorerButton() {
       >
         Inspect contract storage
       </button>
+      <button
+        type="button"
+        className="secondary no-print"
+        onClick={() => {
+          setInventoryOpen((open) => {
+            const next = !open;
+            if (next) setCategories(getOperatorStorageCategories());
+            return next;
+          });
+        }}
+        aria-expanded={inventoryOpen}
+        aria-controls="browser-storage-inventory"
+        data-testid="storage-inventory-toggle"
+      >
+        Browser data inventory
+      </button>
+      {inventoryOpen && (
+        <section
+          id="browser-storage-inventory"
+          aria-label="Browser storage inventory"
+          style={{ marginTop: 12 }}
+        >
+          <p className="tiny muted">
+            Local browser records only. They are convenience inputs and never replace live chain
+            reads; secret keys are not stored. Clearing local data removes browser-stored records
+            only and does not change the chain.
+          </p>
+
+          <div style={{ marginBottom: 16 }}>
+            <h4 style={{ margin: "12px 0 6px 0" }}>Operator Data Categories</h4>
+            <div className="scrolly">
+              <table className="events" data-testid="storage-categories-table">
+                <thead>
+                  <tr>
+                    <th>Category</th>
+                    <th>Description</th>
+                    <th>Count</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {categories.map((cat) => (
+                    <tr key={cat.id}>
+                      <td>
+                        <strong>{cat.name}</strong>
+                      </td>
+                      <td className="tiny">{cat.description}</td>
+                      <td>
+                        <span className="pill">
+                          {cat.itemCount} item{cat.itemCount === 1 ? "" : "s"}
+                        </span>
+                      </td>
+                      <td>
+                        <button
+                          type="button"
+                          className="secondary danger"
+                          onClick={() => setConfirmCategory(cat)}
+                          data-testid={`clear-category-${cat.id}`}
+                        >
+                          Clear
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {confirmCategory && (
+              <div
+                role="alert"
+                className="notice danger"
+                style={{
+                  marginTop: 12,
+                  padding: 12,
+                  border: "1px solid var(--border-danger, #e53e3e)",
+                }}
+                data-testid="clear-category-confirm"
+              >
+                <p style={{ margin: 0 }}>
+                  <strong>Clear {confirmCategory.name}?</strong>
+                </p>
+                <p className="tiny" style={{ margin: "6px 0 10px 0" }}>
+                  Clearing local records removes {confirmCategory.name.toLowerCase()} stored in this
+                  browser only. It does not change the chain or affect any on-chain accounts,
+                  contracts, or transactions.
+                </p>
+                <div className="row" style={{ gap: 8 }}>
+                  <button
+                    type="button"
+                    className="danger"
+                    onClick={() => {
+                      clearOperatorStorageCategory(confirmCategory.id);
+                      announce(
+                        `Cleared ${confirmCategory.name} from browser storage. On-chain state is unchanged.`,
+                      );
+                      setConfirmCategory(null);
+                      setCategories(getOperatorStorageCategories());
+                    }}
+                    data-testid={`confirm-clear-${confirmCategory.id}`}
+                  >
+                    Confirm Clear
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={() => setConfirmCategory(null)}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+
+          <h4 style={{ margin: "16px 0 6px 0" }}>Persisted Helper Keys</h4>
+          <div className="scrolly">
+            <table className="events">
+              <thead>
+                <tr>
+                  <th>Storage key</th>
+                  <th>Purpose</th>
+                  <th>Data category</th>
+                  <th>Public metadata</th>
+                </tr>
+              </thead>
+              <tbody>
+                {STORAGE_INVENTORY.map((entry) => (
+                  <tr key={`${entry.area}:${entry.key}`}>
+                    <td className="mono tiny">
+                      {entry.key} ({entry.area})
+                    </td>
+                    <td className="tiny">{entry.purpose}</td>
+                    <td className="tiny">{entry.category}</td>
+                    <td className="tiny">{entry.containsPublicMetadata ? "Yes" : "No"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
       <StorageExplorer open={state.open} state={state} dispatch={dispatch} />
     </>
   );

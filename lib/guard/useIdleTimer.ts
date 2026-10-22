@@ -113,6 +113,11 @@ export class IdleTimer {
     this.tick();
   }
 
+  /** Recompute against the absolute deadline after a background tab resumes. */
+  checkDeadline(): void {
+    if (this.interval !== null) this.tick();
+  }
+
   private arm(): void {
     this.deadline = this.now() + this.timeoutMs;
   }
@@ -246,13 +251,16 @@ export function useIdleTimer(options: UseIdleTimerOptions): UseIdleTimer {
     timer.start();
 
     const record = () => timer.activity();
+    const checkDeadline = () => timer.checkDeadline();
     for (const event of ACTIVITY_EVENTS) {
       window.addEventListener(event, record, { passive: true });
     }
+    document.addEventListener("visibilitychange", checkDeadline);
     return () => {
       for (const event of ACTIVITY_EVENTS) {
         window.removeEventListener(event, record);
       }
+      document.removeEventListener("visibilitychange", checkDeadline);
       timer.stop();
       timerRef.current = null;
     };
