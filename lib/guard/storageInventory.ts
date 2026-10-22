@@ -2,6 +2,7 @@ import { ADDRESS_BOOK_STORAGE_KEY } from "./addressBook.ts";
 import { ALERT_SETTINGS_STORAGE_KEY } from "./audioAlert.ts";
 import { BYTECODE_CACHE_STORAGE_KEY } from "./bytecodeCache.ts";
 import { DENSITY_STORAGE_KEY } from "./densityStore.ts";
+import { FLEET_VIEW_STORAGE_KEY } from "./fleetTableState.ts";
 import { SCOPED_STORAGE_BASES, SCOPED_STORAGE_PREFIX } from "./guardScoped.ts";
 import { INSTANCE_STORAGE_PREFIX, LEGACY_INSTANCE_STORAGE_KEY } from "./instance.ts";
 import { LAYOUT_STORAGE_KEY, NAMED_LAYOUTS_STORAGE_KEY } from "./layoutStore.ts";
@@ -64,6 +65,13 @@ export const STORAGE_INVENTORY: readonly StorageInventoryEntry[] = [
     key: NAMED_LAYOUTS_STORAGE_KEY,
     area: "localStorage",
     purpose: "Named dashboard panel arrangements",
+    category: "presentation-only",
+    containsPublicMetadata: false,
+  },
+  {
+    key: FLEET_VIEW_STORAGE_KEY,
+    area: "localStorage",
+    purpose: "Fleet table search, filter, and sort preferences",
     category: "presentation-only",
     containsPublicMetadata: false,
   },

@@ -209,6 +209,7 @@ function contextValue(snapshot: GuardSnapshot, server: unknown = noNetworkServer
       guards: [],
       capped: 0,
       cappedLabels: [],
+      gaps: [],
     },
     startWatching: () => {},
     stopWatching: () => {},

@@ -89,6 +89,7 @@ function contextValue(overrides: Record<string, unknown> = {}) {
       ],
       capped: 1,
       cappedLabels: ["Guard C"],
+      gaps: [],
     },
     startWatching: () => {},
     stopWatching: () => {},
@@ -187,5 +188,121 @@ test("the guard-chip filter narrows the merged feed without dropping the others"
     assert.equal(rows(rendered.container).length, 2);
   } finally {
     await rendered.unmount();
+  }
+});
+
+// ── Coverage warnings (#308) ───────────────────────────────────────────────
+
+function feedWith(gaps: unknown[]) {
+  return {
+    watching: true,
+    latestLedger: 100,
+    error: null,
+    lastPolledAt: new Date().toISOString(),
+    guards: [{ guard: GUARD_A, label: "Guard A" }],
+    capped: 0,
+    cappedLabels: [],
+    gaps,
+  };
+}
+
+const GAP_NOTICES = (): HTMLElement[] =>
+  Array.from(document.querySelectorAll("[data-testid=feed-gap-notice]"));
+
+test("a lost range is announced with its ledger range, and the received rows still show", async () => {
+  const rendered = await renderFeed({
+    feed: feedWith([
+      {
+        guard: GUARD_A,
+        label: "Guard A",
+        lost: [{ reason: "history_pruned", fromLedger: 106, toLedger: 165, detectedAtLedger: 170 }],
+        unsettled: null,
+      },
+    ]),
+  });
+  try {
+    const notices = GAP_NOTICES();
+    assert.equal(notices.length, 1);
+    const notice = notices[0]!;
+    assert.equal(
+      notice.getAttribute("role"),
+      "alert",
+      "lost events interrupt, they do not wait to be found",
+    );
+    const text = notice.textContent ?? "";
+    assert.match(text, /Possible gaps in the feed for Guard A/);
+    assert.match(text, /cannot be recovered/);
+    assert.match(text, /Ledgers 106–165/);
+    assert.match(text, /about 5 minutes/);
+    assert.equal(
+      rows(rendered.container).length,
+      2,
+      "the warning does not hide or discard any received row",
+    );
+  } finally {
+    await rendered.unmount();
+  }
+});
+
+test("an unsettled position says its range is unknown and that it will clear", async () => {
+  const rendered = await renderFeed({
+    feed: feedWith([
+      {
+        guard: GUARD_A,
+        label: "Guard A",
+        lost: [],
+        unsettled: {
+          reason: "cursor_regressed",
+          fromLedger: null,
+          toLedger: null,
+          detectedAtLedger: 100,
+        },
+      },
+    ]),
+  });
+  try {
+    const notice = GAP_NOTICES()[0]!;
+    assert.equal(notice.getAttribute("role"), "status");
+    assert.doesNotMatch(notice.className, /danger/);
+    const text = notice.textContent ?? "";
+    assert.match(text, /range is unknown/);
+    assert.match(text, /clears once a later poll is consistent/);
+    assert.doesNotMatch(text, /Ledgers \d/, "no range is invented");
+  } finally {
+    await rendered.unmount();
+  }
+});
+
+test("each affected guard gets its own notice, and a feed with none shows none", async () => {
+  const two = await renderFeed({
+    feed: feedWith([
+      {
+        guard: GUARD_A,
+        label: "Guard A",
+        lost: [{ reason: "history_pruned", fromLedger: 1, toLedger: 2, detectedAtLedger: 9 }],
+        unsettled: null,
+      },
+      {
+        guard: GUARD_B,
+        label: "Guard B",
+        lost: [{ reason: "history_pruned", fromLedger: 5, toLedger: 8, detectedAtLedger: 9 }],
+        unsettled: null,
+      },
+    ]),
+  });
+  try {
+    const labels = GAP_NOTICES().map((notice) => notice.textContent ?? "");
+    assert.equal(labels.length, 2);
+    assert.match(labels[0]!, /Guard A/);
+    assert.match(labels[1]!, /Guard B/);
+  } finally {
+    await two.unmount();
+  }
+
+  const none = await renderFeed({ feed: feedWith([]) });
+  try {
+    assert.equal(GAP_NOTICES().length, 0);
+  } finally {
+    await none.unmount();
   }
 });

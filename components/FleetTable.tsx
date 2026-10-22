@@ -1,13 +1,12 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import Link from "next/link";
 import { formatStroopsWithUnit } from "../lib/guard/formatters.ts";
 import { POLLING, jitteredInterval } from "../lib/guard/polling.ts";
 import {
   pollFleet,
-  filterFleet,
-  sortFleet,
+  defaultSortDirection,
   type FleetRow,
   type DerivedStatus,
   type SortKey,
@@ -18,10 +17,22 @@ import { freezeFailed, freezeSubmitted, writeFailureReason } from "../lib/guard/
 import { announce } from "../lib/guard/useAnnounce.ts";
 import { NETWORK } from "../lib/guard/network.ts";
 import { useGuard } from "./GuardProvider.tsx";
-import { fleetTableState, fleetEmptyCopy } from "../lib/guard/fleetTableState.ts";
+import {
+  DEFAULT_FLEET_VIEW,
+  applyFleetView,
+  createFleetViewStore,
+  fleetTableState,
+  fleetEmptyCopy,
+  hasActiveFleetFilter,
+  isDefaultFleetView,
+  type FleetViewState,
+} from "../lib/guard/fleetTableState.ts";
 import { Skeleton, starLink } from "./bits.tsx";
 import { useRouter } from "next/navigation";
 import { freighterSigner } from "../lib/guard/wallet.ts";
+
+// One store for the tab: the remembered view (search, filters, sort), never row data.
+const fleetViewStore = createFleetViewStore({ networks: [NETWORK.name] });
 
 export function FleetTable() {
   const { wallet, server } = useGuard();
@@ -30,10 +41,17 @@ export function FleetTable() {
   const [rows, setRows] = useState<FleetRow[]>([]);
   const [loading, setLoading] = useState(true);
 
-  const [search, setSearch] = useState("");
-  const [networkFilter, setNetworkFilter] = useState<string | null>(null);
-  const [statusFilter, setStatusFilter] = useState<DerivedStatus | null>(null);
-  const [sortKey, setSortKey] = useState<SortKey | null>(null);
+  // The operator's view of the table (search, filters, sort). It is remembered
+  // across visits but is not registry data: only these choices are stored, never
+  // a row or a status read from the chain. The store serves the default view to
+  // the server and to hydration, then the remembered one.
+  const view = useSyncExternalStore(
+    fleetViewStore.subscribe,
+    fleetViewStore.getSnapshot,
+    fleetViewStore.getServerSnapshot,
+  );
+  const { search, network: networkFilter, status: statusFilter, sortKey, sortDirection } = view;
+  const updateView = (patch: Partial<FleetViewState>) => fleetViewStore.set({ ...view, ...patch });
 
   useEffect(() => {
     let mounted = true;
@@ -59,9 +77,9 @@ export function FleetTable() {
     };
   }, [server]);
 
-  const filteredAndSorted = useMemo(() => {
-    return sortFleet(filterFleet(rows, search, networkFilter, statusFilter), sortKey);
-  }, [rows, search, networkFilter, statusFilter, sortKey]);
+  // Derived from the rows as last read, so a poll that changes a guard's status
+  // immediately moves it in or out of the filtered, sorted view.
+  const filteredAndSorted = useMemo(() => applyFleetView(rows, view), [rows, view]);
 
   const tableState = fleetTableState({
     loading,
@@ -70,11 +88,11 @@ export function FleetTable() {
   });
   const empty = fleetEmptyCopy(tableState);
 
-  const clearFilters = () => {
-    setSearch("");
-    setNetworkFilter(null);
-    setStatusFilter(null);
-  };
+  const clearFilters = () => updateView({ search: "", network: null, status: null });
+  // Back to registry order with nothing filtered.
+  const resetView = () => fleetViewStore.set(DEFAULT_FLEET_VIEW);
+  const viewIsDefault = isDefaultFleetView(view);
+  const filtering = hasActiveFleetFilter(view);
 
   const handleFreeze = async (guard: string) => {
     if (!wallet) {
@@ -133,7 +151,7 @@ export function FleetTable() {
           <input
             type="search"
             value={search}
-            onChange={(e) => setSearch(e.target.value)}
+            onChange={(e) => updateView({ search: e.target.value })}
             placeholder="Search by name or address..."
           />
         </label>
@@ -143,7 +161,7 @@ export function FleetTable() {
             <span className="lbl">Network</span>
             <select
               value={networkFilter || ""}
-              onChange={(e) => setNetworkFilter(e.target.value || null)}
+              onChange={(e) => updateView({ network: e.target.value || null })}
             >
               <option value="">All Networks</option>
               <option value={NETWORK.name}>{NETWORK.name}</option>
@@ -153,26 +171,67 @@ export function FleetTable() {
             <span className="lbl">Status</span>
             <select
               value={statusFilter || ""}
-              onChange={(e) => setStatusFilter((e.target.value as DerivedStatus) || null)}
+              onChange={(e) => updateView({ status: (e.target.value as DerivedStatus) || null })}
             >
               <option value="">All Statuses</option>
               <option value="Active">Active</option>
               <option value="Frozen">Frozen</option>
               <option value="Expired">Expired</option>
+              {/* Unread is its own state, not a flavour of healthy: a guard whose
+                  read failed matches this and never "Active". */}
+              <option value="Unknown">Unknown (not read)</option>
             </select>
           </label>
           <label className="field" style={{ marginBottom: 0, flex: 1 }}>
             <span className="lbl">Sort</span>
             <select
               value={sortKey || ""}
-              onChange={(e) => setSortKey((e.target.value as SortKey) || null)}
+              onChange={(e) => {
+                const key = (e.target.value as SortKey) || null;
+                updateView({
+                  sortKey: key,
+                  sortDirection: key ? defaultSortDirection(key) : "asc",
+                });
+              }}
             >
-              <option value="">None</option>
+              <option value="">Registry order</option>
+              <option value="label">Label</option>
+              <option value="address">Address</option>
+              <option value="status">Status (needs attention first)</option>
               <option value="spend">Spend (High to Low)</option>
               <option value="expiration">Expiration (Soonest)</option>
             </select>
           </label>
         </div>
+      </div>
+
+      <div className="row" style={{ marginTop: 8, gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+        {sortKey && (
+          <button
+            type="button"
+            className="secondary"
+            style={{ padding: "4px 8px", fontSize: "0.8em" }}
+            onClick={() => updateView({ sortDirection: sortDirection === "asc" ? "desc" : "asc" })}
+            aria-label={`Sort direction: ${sortDirection === "asc" ? "ascending" : "descending"}. Activate to reverse.`}
+          >
+            {sortDirection === "asc" ? "Ascending ↑" : "Descending ↓"}
+          </button>
+        )}
+        {!viewIsDefault && (
+          <button
+            type="button"
+            className="secondary"
+            style={{ padding: "4px 8px", fontSize: "0.8em" }}
+            onClick={resetView}
+          >
+            Reset view
+          </button>
+        )}
+        {filtering && tableState.kind === "rows" && (
+          <span className="tiny muted" role="status">
+            Showing {filteredAndSorted.length} of {rows.length} guard{rows.length !== 1 ? "s" : ""}
+          </span>
+        )}
       </div>
 
       <div className="scrolly table-stack" style={{ marginTop: 14 }}>

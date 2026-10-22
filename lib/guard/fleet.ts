@@ -95,20 +95,95 @@ export function filterFleet(
   });
 }
 
-export type SortKey = "spend" | "expiration";
+export type SortKey = "label" | "address" | "status" | "spend" | "expiration";
 
-export function sortFleet(rows: FleetRow[], sortKey: SortKey | null): FleetRow[] {
+export type SortDirection = "asc" | "desc";
+
+/** Every sort key, in the order the table's sort control lists them. */
+export const SORT_KEYS: readonly SortKey[] = ["label", "address", "status", "spend", "expiration"];
+
+/**
+ * The direction a key sorts in before the operator flips it: spend is
+ * "biggest first" (the existing behaviour), everything else reads ascending.
+ */
+export function defaultSortDirection(key: SortKey): SortDirection {
+  return key === "spend" ? "desc" : "asc";
+}
+
+/**
+ * Where each live status sits when sorting by status, ascending: the rows that
+ * need an operator first. `Unknown` (the read failed or was never made) has its
+ * own rank between the unhealthy states and `Active`, so an unread guard is
+ * never grouped with — or mistaken for — a guard confirmed healthy.
+ */
+export const STATUS_SORT_RANK: Readonly<Record<DerivedStatus, number>> = {
+  Frozen: 0,
+  Expired: 1,
+  Unknown: 2,
+  Active: 3,
+};
+
+/**
+ * Label order that is the same on every machine and reads the way people expect:
+ * case-insensitive, with digit runs compared as numbers ("Guard 2" before
+ * "Guard 10").
+ */
+const LABEL_COLLATOR = new Intl.Collator("en", { sensitivity: "base", numeric: true });
+
+function compareBigint(a: bigint, b: bigint): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function compareByKey(a: FleetRow, b: FleetRow, key: SortKey): number {
+  switch (key) {
+    case "label":
+      return LABEL_COLLATOR.compare(a.contact.label, b.contact.label);
+    case "address":
+      return a.contact.address < b.contact.address
+        ? -1
+        : a.contact.address > b.contact.address
+          ? 1
+          : 0;
+    case "status":
+      return STATUS_SORT_RANK[a.derivedStatus] - STATUS_SORT_RANK[b.derivedStatus];
+    case "spend":
+      return compareBigint(a.spend24h, b.spend24h);
+    case "expiration":
+      // Callers handle missing countdowns before reaching here.
+      return compareBigint(a.dmsCountdownSecs ?? 0n, b.dmsCountdownSecs ?? 0n);
+  }
+}
+
+/**
+ * Sort fleet rows deterministically, without mutating the input.
+ *
+ * `rows` is expected in registry order. Ties on the chosen key are broken by
+ * each row's position in that input — in the same direction regardless of
+ * `direction` — so equal rows never reshuffle between polls or when the
+ * direction is flipped, and the underlying registry order is what survives
+ * every sort. A `null` key is the default order: the input, untouched.
+ *
+ * For `expiration`, a row with no countdown has nothing to compare, so it goes
+ * last in both directions rather than being treated as "zero seconds left".
+ */
+export function sortFleet(
+  rows: FleetRow[],
+  sortKey: SortKey | null,
+  direction: SortDirection = sortKey ? defaultSortDirection(sortKey) : "asc",
+): FleetRow[] {
   if (!sortKey) return rows;
-  return [...rows].sort((a, b) => {
-    if (sortKey === "spend") {
-      return a.spend24h < b.spend24h ? 1 : a.spend24h > b.spend24h ? -1 : 0;
-    }
-    if (sortKey === "expiration") {
-      // Missing countdowns go to the end
-      const aDms = a.dmsCountdownSecs ?? 9999999999999n;
-      const bDms = b.dmsCountdownSecs ?? 9999999999999n;
-      return aDms < bDms ? -1 : aDms > bDms ? 1 : 0;
-    }
-    return 0;
-  });
+  const sign = direction === "desc" ? -1 : 1;
+  return rows
+    .map((row, index) => ({ row, index }))
+    .sort((a, b) => {
+      if (sortKey === "expiration") {
+        const aMissing = a.row.dmsCountdownSecs === null;
+        const bMissing = b.row.dmsCountdownSecs === null;
+        if (aMissing !== bMissing) return aMissing ? 1 : -1;
+        if (aMissing && bMissing) return a.index - b.index;
+      }
+      const byKey = compareByKey(a.row, b.row, sortKey) * sign;
+      return byKey !== 0 ? byKey : a.index - b.index;
+    })
+    .map((entry) => entry.row);
 }

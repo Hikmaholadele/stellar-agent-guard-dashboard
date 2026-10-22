@@ -323,6 +323,12 @@ label.field .hint {
   margin-bottom: 3px;
 }
 
+.field-error {
+  display: block;
+  color: var(--danger);
+  margin-top: 4px;
+}
+
 /*
  * Warning tier — the shared primitive for "safe, but not doing what the
  * operator assumed", established by the default-deny status pass (issue #25)

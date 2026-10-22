@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { parseAddressList, exportRFC4180 } from "../../lib/guard/csv.ts";
+import { parseAddressList, exportRFC4180, neutralizeFormulaCell } from "../../lib/guard/csv.ts";
 
 const VALID_G = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const VALID_C = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -41,4 +41,14 @@ test("reports row-by-row errors for invalid addresses", () => {
 
 test("exports to RFC 4180 format with CRLF", () => {
   assert.equal(exportRFC4180(["A", "B"]), '"A"\r\n"B"');
+});
+
+test("neutralizeFormulaCell escapes formula-leading cells", () => {
+  assert.equal(neutralizeFormulaCell("hello"), "hello");
+  assert.equal(neutralizeFormulaCell("=sum(A1)"), "'" + "=sum(A1)");
+  assert.equal(neutralizeFormulaCell("+5"), "'" + "+5");
+  assert.equal(neutralizeFormulaCell("-3"), "'" + "-3");
+  assert.equal(neutralizeFormulaCell("@cell"), "'" + "@cell");
+  assert.equal(neutralizeFormulaCell("  =  "), "'" + "  =  ");
+  assert.equal(neutralizeFormulaCell(""), "");
 });

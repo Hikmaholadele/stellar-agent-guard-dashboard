@@ -51,6 +51,9 @@ export const EMPTY_DRAFT: PolicyDraft = {
   dmsGraceSecs: "",
 };
 
+const MAX_POLICY_CAP = (1n << 127n) - 1n;
+const MAX_POLICY_SECONDS = (1n << 64n) - 1n;
+
 export interface FieldIssue {
   field: keyof PolicyDraft;
   message: string;
@@ -75,8 +78,17 @@ function parseCap(
     return 0n;
   }
   try {
-    // BigInt parses arbitrary precision, so an i128 cap larger than 2^53 survives.
-    return BigInt(trimmed);
+    const parsed = BigInt(trimmed);
+    const maximum =
+      field === "perTxCap" || field === "windowCap" ? MAX_POLICY_CAP : MAX_POLICY_SECONDS;
+    if (parsed > maximum) {
+      issues.push({
+        field,
+        message: `${label} exceeds the maximum supported value of ${maximum}`,
+      });
+      return 0n;
+    }
+    return parsed;
   } catch {
     issues.push({ field, message: `${label} is not a valid integer` });
     return 0n;
@@ -187,6 +199,21 @@ export function buildPolicyConfig(draft: PolicyDraft): ValidationResult {
     dms_grace_secs: dmsGraceSecs,
   };
   return { ok: true, config, scval: policyToScVal(config) };
+}
+
+/** Return the first actionable validation message for each affected field. */
+export function validatePolicyDraftFields(draft: PolicyDraft): Record<string, string> {
+  const result = buildPolicyConfig(draft);
+  if (result.ok) return {};
+
+  const errors: Record<string, string> = {};
+  for (const issue of result.issues) errors[issue.field] ??= issue.message;
+  return errors;
+}
+
+/** Compare complete policy drafts without narrowing their string-backed values. */
+export function policyDraftsEqual(left: PolicyDraft, right: PolicyDraft): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function splitOnce(value: string, separator: string): [string, string] {

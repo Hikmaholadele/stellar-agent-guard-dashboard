@@ -21,6 +21,8 @@
  * one mock channel bus rather than a real browser.
  */
 
+import { looksLikeContractAddress } from "./instance.ts";
+
 /** The channel and storage key name. Versioned so a shape change cannot be misread. */
 export const TAB_SYNC_CHANNEL = "stellar-agent-guard-dashboard.tab-sync.v1";
 export const TAB_SYNC_STORAGE_KEY = "stellar-agent-guard-dashboard.tab-sync.v1";
@@ -36,13 +38,18 @@ const GUARD_WRITE_LOCK_PREFIX = "stellar-agent-guard-dashboard.guard-write.v1";
  * payloads are the chain's to describe, not this module's.
  */
 export type TabSyncEventType =
-  "GUARD_CHANGED" | "FREEZE_STATE_CHANGED" | "WALLET_DISCONNECTED" | "POLICY_UPDATED";
+  | "GUARD_CHANGED"
+  | "FREEZE_STATE_CHANGED"
+  | "WALLET_DISCONNECTED"
+  | "POLICY_UPDATED"
+  | "REGISTRY_CHANGED";
 
 export const TAB_SYNC_EVENT_TYPES: readonly TabSyncEventType[] = [
   "GUARD_CHANGED",
   "FREEZE_STATE_CHANGED",
   "WALLET_DISCONNECTED",
   "POLICY_UPDATED",
+  "REGISTRY_CHANGED",
 ];
 
 /** One announcement. `origin` lets a tab ignore its own broadcast. */
@@ -77,6 +84,105 @@ export function isTabSyncEvent(value: unknown): value is TabSyncEvent {
     return false;
   }
   return true;
+}
+
+// ── Registry changes ───────────────────────────────────────────────────────
+//
+// A guard added, renamed or removed in one tab leaves every other tab holding a
+// stale in-memory list: the old label in the selector, a deleted guard still
+// tailed. `REGISTRY_CHANGED` tells them to re-read. Like every event on this
+// channel it carries no state — not the new label, not the new list. The
+// receiving tab reloads the saved registry itself, so a forged or reordered
+// message can at worst cause one redundant read, never plant an entry.
+
+/** Version of the registry-change payload. Bump on any shape change. */
+export const REGISTRY_SYNC_VERSION = 1;
+
+export type RegistryChangeKind = "add" | "rename" | "remove";
+
+export const REGISTRY_CHANGE_KINDS: readonly RegistryChangeKind[] = ["add", "rename", "remove"];
+
+/** A validated registry-change announcement from another tab. */
+export interface RegistryChangeNotice {
+  kind: RegistryChangeKind;
+  /** The guard the change concerns. */
+  guard: string;
+  /** The emitting tab's counter, increasing by one per announcement. */
+  revision: number;
+  /** The emitting tab. */
+  origin: string;
+}
+
+/** The payload for a registry change: a version, the kind and a revision. */
+export function registryChangePayload(
+  kind: RegistryChangeKind,
+  revision: number,
+): Record<string, unknown> {
+  return { v: REGISTRY_SYNC_VERSION, kind, revision };
+}
+
+/**
+ * Validate an incoming `REGISTRY_CHANGED` event, or `null` when it is not one
+ * this build understands: wrong type, unknown payload version, unknown kind, a
+ * revision that is not a positive integer, or a guard that is not a contract
+ * address. Nothing is repaired — a malformed event is dropped.
+ */
+export function parseRegistryChange(event: TabSyncEvent): RegistryChangeNotice | null {
+  if (event.type !== "REGISTRY_CHANGED") return null;
+  const payload = event.payload;
+  if (typeof payload !== "object" || payload === null) return null;
+  if (payload.v !== REGISTRY_SYNC_VERSION) return null;
+  const kind = REGISTRY_CHANGE_KINDS.find((candidate) => candidate === payload.kind);
+  if (kind === undefined) return null;
+  const revision = payload.revision;
+  if (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 1) return null;
+  if (typeof event.guard !== "string" || !looksLikeContractAddress(event.guard)) return null;
+  return { kind, guard: event.guard, revision, origin: event.origin };
+}
+
+/** Tabs remembered for replay protection; a console rarely has more than a handful open. */
+const REGISTRY_REPLAY_TABS = 64;
+
+/**
+ * Accepts each tab's announcements once and in order.
+ *
+ * The coordinator already drops a tab's own echo; this additionally drops a
+ * duplicate or an out-of-order replay (the same event delivered twice, a stale
+ * one arriving late) by remembering the highest revision seen per tab. It
+ * returns the validated notice to act on, or `null` to ignore the event.
+ */
+export function createRegistryChangeFilter(): (event: TabSyncEvent) => RegistryChangeNotice | null {
+  const lastRevision = new Map<string, number>();
+  return (event) => {
+    const notice = parseRegistryChange(event);
+    if (notice === null) return null;
+    const seen = lastRevision.get(notice.origin) ?? 0;
+    if (notice.revision <= seen) return null;
+    lastRevision.delete(notice.origin);
+    lastRevision.set(notice.origin, notice.revision);
+    if (lastRevision.size > REGISTRY_REPLAY_TABS) {
+      const oldest = lastRevision.keys().next().value;
+      if (oldest !== undefined) lastRevision.delete(oldest);
+    }
+    return notice;
+  };
+}
+
+/**
+ * Announce registry changes from this tab. One per tab: the revision counter it
+ * owns is what lets other tabs drop duplicates and replays.
+ */
+export function createRegistryAnnouncer(
+  tabSync: Pick<TabSyncCoordinator, "broadcast">,
+): (kind: RegistryChangeKind, guard: string) => TabSyncEvent {
+  let revision = 0;
+  return (kind, guard) => {
+    revision += 1;
+    return tabSync.broadcast("REGISTRY_CHANGED", {
+      guard,
+      payload: registryChangePayload(kind, revision),
+    });
+  };
 }
 
 // ── Transport seams ────────────────────────────────────────────────────────

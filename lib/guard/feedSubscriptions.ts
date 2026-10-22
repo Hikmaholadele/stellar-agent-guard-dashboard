@@ -23,6 +23,7 @@
  */
 
 import type { GuardEvent } from "stellar-agent-guard-sdk";
+import type { FeedGap, FeedGapState } from "./telemetry.ts";
 
 /**
  * The displayed cap on simultaneously tailed guards.
@@ -43,7 +44,13 @@ export interface FeedSource {
 /** The shape `GuardFeed` satisfies, narrowed so tests can supply a mock stream. */
 export interface GuardFeedLike {
   readonly guard: string;
-  pollOnce(limit?: number): Promise<{ events: GuardEvent[]; cursor: string; latestLedger: number }>;
+  pollOnce(limit?: number): Promise<{
+    events: GuardEvent[];
+    cursor: string;
+    latestLedger: number;
+    /** Holes in coverage this runner knows about; absent for runners that cannot tell. */
+    gaps?: FeedGapState;
+  }>;
   /** Release the runner. Absent on some runners; called when one is reconciled away. */
   stop?(): void;
 }
@@ -55,6 +62,38 @@ export interface FeedWatchStatus {
   ok: boolean;
   error: string | null;
   latestLedger: number | null;
+  /**
+   * Holes in this guard's coverage. Kept from the last poll that reported them
+   * when a later poll fails, so a transport error does not make a known gap
+   * disappear from the screen.
+   */
+  gaps: FeedGapState | null;
+}
+
+/** One guard's coverage warning, ready to render. */
+export interface FeedGapNotice {
+  guard: string;
+  label: string;
+  /** Unrecoverable ranges. */
+  lost: FeedGap[];
+  /** A discontinuity from the latest poll that the next clean poll clears. */
+  unsettled: FeedGap | null;
+}
+
+/** The guards that currently have something to warn about, in tailing order. */
+export function feedGapNotices(watch: readonly FeedWatchStatus[]): FeedGapNotice[] {
+  const notices: FeedGapNotice[] = [];
+  for (const entry of watch) {
+    const gaps = entry.gaps;
+    if (!gaps || (gaps.lost.length === 0 && gaps.unsettled === null)) continue;
+    notices.push({
+      guard: entry.guard,
+      label: entry.label,
+      lost: gaps.lost,
+      unsettled: gaps.unsettled,
+    });
+  }
+  return notices;
 }
 
 export interface FeedPollResult {
@@ -78,6 +117,7 @@ export class MultiGuardFeed {
   private readonly createFeed: (guard: string) => GuardFeedLike;
   private readonly runners = new Map<string, GuardFeedLike>();
   private readonly labels = new Map<string, string>();
+  private readonly gapMemory = new Map<string, FeedGapState>();
   private overflow: FeedSource[] = [];
   private stopped = false;
 
@@ -117,6 +157,7 @@ export class MultiGuardFeed {
       if (keep.has(guard)) continue;
       this.runners.delete(guard);
       this.labels.delete(guard);
+      this.gapMemory.delete(guard);
       runner.stop?.();
     }
 
@@ -182,7 +223,15 @@ export class MultiGuardFeed {
       const label = this.labels.get(guard) ?? guard;
       try {
         const page = await runner.pollOnce(limit);
-        watch.push({ guard, label, ok: true, error: null, latestLedger: page.latestLedger });
+        if (page.gaps) this.gapMemory.set(guard, page.gaps);
+        watch.push({
+          guard,
+          label,
+          ok: true,
+          error: null,
+          latestLedger: page.latestLedger,
+          gaps: this.gapMemory.get(guard) ?? null,
+        });
         merged.push(...page.events);
         latestLedger =
           latestLedger === null ? page.latestLedger : Math.max(latestLedger, page.latestLedger);
@@ -193,6 +242,7 @@ export class MultiGuardFeed {
           ok: false,
           error: error instanceof Error ? error.message : String(error),
           latestLedger: null,
+          gaps: this.gapMemory.get(guard) ?? null,
         });
       }
     }
@@ -207,6 +257,7 @@ export class MultiGuardFeed {
     for (const runner of this.runners.values()) runner.stop?.();
     this.runners.clear();
     this.labels.clear();
+    this.gapMemory.clear();
     this.overflow = [];
   }
 }

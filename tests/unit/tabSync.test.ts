@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  REGISTRY_SYNC_VERSION,
   TAB_SYNC_CHANNEL,
   TAB_SYNC_STORAGE_KEY,
   acquireGuardWriteLock,
+  createRegistryAnnouncer,
+  createRegistryChangeFilter,
   createTabSync,
   isTabSyncEvent,
+  parseRegistryChange,
+  registryChangePayload,
   subscribeGuardWriteLock,
   type TabChannel,
   type TabEventTarget,
@@ -258,7 +263,7 @@ describe("tab sync event validation", () => {
     );
   });
 
-  it("rejects anything that is not one of the four broadcastable changes", () => {
+  it("rejects anything that is not one of the broadcastable changes", () => {
     assert.equal(isTabSyncEvent({ type: "NOT_A_TYPE", origin: "tab-a", at: "now" }), false);
     assert.equal(isTabSyncEvent(null), false);
     assert.equal(isTabSyncEvent("GUARD_CHANGED"), false);
@@ -576,6 +581,397 @@ describe("no transport available", () => {
       assert.deepEqual(received, []);
     } finally {
       coordinator.close();
+    }
+  });
+});
+
+// ── Registry changes (#305) ────────────────────────────────────────────────
+
+const SECOND_GUARD = "CAPADGEK457RHKN4RYVUMDJTFHDSG7R5HREQONKLYK7MFKC5WFENPP44";
+
+function registryEvent(overrides: Record<string, unknown> = {}): TabSyncEvent {
+  return {
+    type: "REGISTRY_CHANGED",
+    origin: "tab-a",
+    at: FIXED_TIME.toISOString(),
+    guard: GUARD,
+    payload: registryChangePayload("add", 1),
+    ...overrides,
+  } as TabSyncEvent;
+}
+
+describe("registry change payload", () => {
+  it("is versioned and names the kind and revision, never the new state", () => {
+    assert.deepEqual(registryChangePayload("rename", 3), {
+      v: REGISTRY_SYNC_VERSION,
+      kind: "rename",
+      revision: 3,
+    });
+    assert.equal(REGISTRY_SYNC_VERSION, 1);
+  });
+
+  it("is a broadcastable event type", () => {
+    assert.equal(isTabSyncEvent(registryEvent()), true);
+  });
+
+  it("accepts add, rename and remove", () => {
+    for (const kind of ["add", "rename", "remove"] as const) {
+      const notice = parseRegistryChange(
+        registryEvent({ payload: registryChangePayload(kind, 2) }),
+      );
+      assert.deepEqual(notice, { kind, guard: GUARD, revision: 2, origin: "tab-a" });
+    }
+  });
+
+  it("rejects every event that is not a well-formed registry change", () => {
+    const bad: Array<[string, TabSyncEvent]> = [
+      ["another event type", registryEvent({ type: "GUARD_CHANGED" })],
+      ["no payload", registryEvent({ payload: undefined })],
+      ["an array payload", registryEvent({ payload: [] as unknown as Record<string, unknown> })],
+      ["an unknown version", registryEvent({ payload: { v: 2, kind: "add", revision: 1 } })],
+      ["a string version", registryEvent({ payload: { v: "1", kind: "add", revision: 1 } })],
+      ["no version", registryEvent({ payload: { kind: "add", revision: 1 } })],
+      ["an unknown kind", registryEvent({ payload: { v: 1, kind: "replace", revision: 1 } })],
+      ["an empty kind", registryEvent({ payload: { v: 1, kind: "", revision: 1 } })],
+      ["a zero revision", registryEvent({ payload: { v: 1, kind: "add", revision: 0 } })],
+      ["a negative revision", registryEvent({ payload: { v: 1, kind: "add", revision: -1 } })],
+      ["a fractional revision", registryEvent({ payload: { v: 1, kind: "add", revision: 1.5 } })],
+      ["a string revision", registryEvent({ payload: { v: 1, kind: "add", revision: "1" } })],
+      ["a NaN revision", registryEvent({ payload: { v: 1, kind: "add", revision: Number.NaN } })],
+      ["an unsafe revision", registryEvent({ payload: { v: 1, kind: "add", revision: 2 ** 60 } })],
+      ["no guard", registryEvent({ guard: undefined })],
+      ["a guard that is not a contract address", registryEvent({ guard: "GABC" })],
+      ["an account address", registryEvent({ guard: `G${GUARD.slice(1)}` })],
+      ["a lower-case address", registryEvent({ guard: GUARD.toLowerCase() })],
+    ];
+    for (const [name, event] of bad) {
+      assert.equal(parseRegistryChange(event), null, name);
+    }
+  });
+});
+
+describe("registry change filter", () => {
+  it("acts on each announcement once", () => {
+    const accept = createRegistryChangeFilter();
+    const first = registryEvent({ payload: registryChangePayload("add", 1) });
+    assert.ok(accept(first));
+    assert.equal(accept(first), null, "the same event delivered twice");
+    assert.equal(accept(registryEvent({ payload: registryChangePayload("add", 1) })), null);
+  });
+
+  it("drops an older revision that arrives late and accepts a newer one", () => {
+    const accept = createRegistryChangeFilter();
+    assert.ok(accept(registryEvent({ payload: registryChangePayload("rename", 5) })));
+    assert.equal(accept(registryEvent({ payload: registryChangePayload("remove", 4) })), null);
+    assert.ok(accept(registryEvent({ payload: registryChangePayload("remove", 6) })));
+  });
+
+  it("tracks each tab on its own", () => {
+    const accept = createRegistryChangeFilter();
+    assert.ok(accept(registryEvent({ origin: "tab-a", payload: registryChangePayload("add", 1) })));
+    assert.ok(accept(registryEvent({ origin: "tab-b", payload: registryChangePayload("add", 1) })));
+    assert.equal(
+      accept(registryEvent({ origin: "tab-a", payload: registryChangePayload("add", 1) })),
+      null,
+    );
+  });
+
+  it("ignores events that are not registry changes and does not let them move the counter", () => {
+    const accept = createRegistryChangeFilter();
+    assert.equal(accept(registryEvent({ type: "GUARD_CHANGED" })), null);
+    assert.ok(accept(registryEvent({ payload: registryChangePayload("add", 1) })));
+    assert.equal(accept(registryEvent({ payload: { v: 9, kind: "add", revision: 99 } })), null);
+    assert.ok(
+      accept(registryEvent({ payload: registryChangePayload("add", 2) })),
+      "a rejected event moved nothing",
+    );
+  });
+
+  it("bounds the tabs it remembers", () => {
+    const accept = createRegistryChangeFilter();
+    for (let tab = 0; tab < 200; tab += 1) {
+      assert.ok(
+        accept(registryEvent({ origin: `tab-${tab}`, payload: registryChangePayload("add", 1) })),
+      );
+    }
+    // The oldest tabs were forgotten, so a very old tab's revision 1 is accepted
+    // again rather than memory growing without bound; recent tabs are still deduplicated.
+    assert.ok(accept(registryEvent({ origin: "tab-0", payload: registryChangePayload("add", 1) })));
+    assert.equal(
+      accept(registryEvent({ origin: "tab-199", payload: registryChangePayload("add", 1) })),
+      null,
+    );
+  });
+});
+
+describe("registry change announcer", () => {
+  it("numbers announcements 1, 2, 3… and sends the guard with a versioned payload", () => {
+    const sent: Array<{
+      type: string;
+      options?: { guard?: string; payload?: Record<string, unknown> };
+    }> = [];
+    const announce = createRegistryAnnouncer({
+      broadcast: (type, options) => {
+        sent.push({ type, ...(options === undefined ? {} : { options }) });
+        return registryEvent();
+      },
+    });
+    announce("add", GUARD);
+    announce("rename", GUARD);
+    announce("remove", SECOND_GUARD);
+
+    assert.deepEqual(
+      sent.map((entry) => [entry.type, entry.options?.guard, entry.options?.payload]),
+      [
+        ["REGISTRY_CHANGED", GUARD, registryChangePayload("add", 1)],
+        ["REGISTRY_CHANGED", GUARD, registryChangePayload("rename", 2)],
+        ["REGISTRY_CHANGED", SECOND_GUARD, registryChangePayload("remove", 3)],
+      ],
+    );
+  });
+});
+
+describe("registry sync across tabs over BroadcastChannel", () => {
+  it("delivers add, rename and remove to the other tab, validated and in order", () => {
+    const hub = createMockHub();
+    const tabA = createTabSync({ channelFactory: hub.create, origin: "tab-a" });
+    const tabB = createTabSync({ channelFactory: hub.create, origin: "tab-b" });
+    try {
+      const accept = createRegistryChangeFilter();
+      const notices: Array<[string, string]> = [];
+      tabB.subscribe((event) => {
+        const notice = accept(event);
+        if (notice) notices.push([notice.kind, notice.guard]);
+      });
+      const announce = createRegistryAnnouncer(tabA);
+
+      announce("add", GUARD);
+      announce("rename", GUARD);
+      announce("remove", GUARD);
+
+      assert.deepEqual(notices, [
+        ["add", GUARD],
+        ["rename", GUARD],
+        ["remove", GUARD],
+      ]);
+    } finally {
+      tabA.close();
+      tabB.close();
+    }
+  });
+
+  it("never echoes a tab's own announcement back to it, even on a bus that echoes", () => {
+    const hub = createMockHub({ echo: true });
+    const tabA = createTabSync({ channelFactory: hub.create, origin: "tab-a" });
+    try {
+      const received: TabSyncEvent[] = [];
+      tabA.subscribe((event) => received.push(event));
+      createRegistryAnnouncer(tabA)("add", GUARD);
+      assert.deepEqual(received, []);
+    } finally {
+      tabA.close();
+    }
+  });
+
+  it("acts once when the same announcement arrives twice", () => {
+    const hub = createMockHub();
+    const tabB = createTabSync({ channelFactory: hub.create, origin: "tab-b" });
+    const raw = hub.create(TAB_SYNC_CHANNEL);
+    try {
+      const accept = createRegistryChangeFilter();
+      let acted = 0;
+      tabB.subscribe((event) => {
+        if (accept(event)) acted += 1;
+      });
+      const event = registryEvent({ payload: registryChangePayload("remove", 1) });
+      raw.postMessage(event);
+      raw.postMessage(event);
+      assert.equal(acted, 1);
+    } finally {
+      raw.close();
+      tabB.close();
+    }
+  });
+
+  it("drops a forged or malformed announcement without acting on it", () => {
+    const hub = createMockHub();
+    const tabB = createTabSync({ channelFactory: hub.create, origin: "tab-b" });
+    const raw = hub.create(TAB_SYNC_CHANNEL);
+    try {
+      const accept = createRegistryChangeFilter();
+      let acted = 0;
+      tabB.subscribe((event) => {
+        if (accept(event)) acted += 1;
+      });
+      raw.postMessage(registryEvent({ payload: { v: 99, kind: "remove", revision: 1 } }));
+      raw.postMessage(registryEvent({ payload: { v: 1, kind: "wipe", revision: 1 } }));
+      raw.postMessage(registryEvent({ guard: "<script>alert(1)</script>" }));
+      raw.postMessage({ type: "REGISTRY_CHANGED", origin: "tab-a" });
+      raw.postMessage("REGISTRY_CHANGED");
+      assert.equal(acted, 0);
+    } finally {
+      raw.close();
+      tabB.close();
+    }
+  });
+
+  it("registers one listener however many subscribers, and releases the tab on close", () => {
+    const hub = createMockHub();
+    const tabA = createTabSync({ channelFactory: hub.create, origin: "tab-a" });
+    const tabB = createTabSync({ channelFactory: hub.create, origin: "tab-b" });
+    const received: string[] = [];
+    tabB.subscribe(() => received.push("one"));
+    tabB.subscribe(() => received.push("two"));
+    tabB.subscribe(() => received.push("three"));
+    createRegistryAnnouncer(tabA)("add", GUARD);
+    assert.deepEqual(received, ["one", "two", "three"]);
+    assert.equal(hub.peerCount(TAB_SYNC_CHANNEL), 2);
+
+    // Disposing the tab releases the channel and drops its listeners.
+    tabB.close();
+    assert.equal(hub.peerCount(TAB_SYNC_CHANNEL), 1);
+    createRegistryAnnouncer(tabA)("remove", GUARD);
+    assert.equal(received.length, 3, "a closed tab receives nothing more");
+    tabA.close();
+    assert.equal(hub.peerCount(TAB_SYNC_CHANNEL), 0);
+  });
+
+  it("announcing after close is inert", () => {
+    const hub = createMockHub();
+    const tabA = createTabSync({ channelFactory: hub.create, origin: "tab-a" });
+    const tabB = createTabSync({ channelFactory: hub.create, origin: "tab-b" });
+    try {
+      const received: TabSyncEvent[] = [];
+      tabB.subscribe((event) => received.push(event));
+      tabA.close();
+      createRegistryAnnouncer(tabA)("add", GUARD);
+      assert.deepEqual(received, []);
+    } finally {
+      tabB.close();
+    }
+  });
+});
+
+describe("registry sync over the localStorage fallback", () => {
+  function twoTabs() {
+    const { storage, raw } = createMockStorage();
+    const events = createMockEventTarget();
+    const tabA = createTabSync({
+      channelFactory: null,
+      storage,
+      eventTarget: events.target,
+      origin: "tab-a",
+    });
+    const tabB = createTabSync({
+      channelFactory: null,
+      storage,
+      eventTarget: events.target,
+      origin: "tab-b",
+    });
+    return { raw, events, tabA, tabB };
+  }
+
+  it("is the transport when BroadcastChannel is unavailable", () => {
+    const { tabA, tabB } = twoTabs();
+    try {
+      assert.equal(tabA.transport, "storage");
+      assert.equal(tabB.transport, "storage");
+    } finally {
+      tabA.close();
+      tabB.close();
+    }
+  });
+
+  it("delivers add, rename and remove through storage events", () => {
+    const { raw, events, tabA, tabB } = twoTabs();
+    try {
+      const accept = createRegistryChangeFilter();
+      const notices: Array<[string, string]> = [];
+      tabB.subscribe((event) => {
+        const notice = accept(event);
+        if (notice) notices.push([notice.kind, notice.guard]);
+      });
+      const announce = createRegistryAnnouncer(tabA);
+
+      for (const [kind, guard] of [
+        ["add", GUARD],
+        ["rename", GUARD],
+        ["remove", SECOND_GUARD],
+      ] as const) {
+        announce(kind, guard);
+        // The browser fires `storage` in the other tabs; emulate exactly that.
+        events.emit({ key: TAB_SYNC_STORAGE_KEY, newValue: raw() });
+      }
+
+      assert.deepEqual(notices, [
+        ["add", GUARD],
+        ["rename", GUARD],
+        ["remove", SECOND_GUARD],
+      ]);
+    } finally {
+      tabA.close();
+      tabB.close();
+    }
+  });
+
+  it("does not replay a tab's own write to it, and ignores a replayed storage event", () => {
+    const { raw, events, tabA, tabB } = twoTabs();
+    try {
+      const accept = createRegistryChangeFilter();
+      const ownReceived: TabSyncEvent[] = [];
+      let acted = 0;
+      tabA.subscribe((event) => ownReceived.push(event));
+      tabB.subscribe((event) => {
+        if (accept(event)) acted += 1;
+      });
+
+      createRegistryAnnouncer(tabA)("add", GUARD);
+      const written = raw();
+      events.emit({ key: TAB_SYNC_STORAGE_KEY, newValue: written });
+      events.emit({ key: TAB_SYNC_STORAGE_KEY, newValue: written });
+
+      assert.deepEqual(ownReceived, [], "the writer never hears itself");
+      assert.equal(acted, 1, "the same storage event delivered twice acts once");
+    } finally {
+      tabA.close();
+      tabB.close();
+    }
+  });
+
+  it("registers one storage listener however many subscribers, and removes it on close", () => {
+    const { events, tabA, tabB } = twoTabs();
+    tabB.subscribe(() => {});
+    tabB.subscribe(() => {});
+    tabB.subscribe(() => {});
+    tabA.subscribe(() => {});
+    assert.equal(events.listenerCount(), 2, "one per tab, not one per subscriber");
+
+    tabB.close();
+    assert.equal(events.listenerCount(), 1);
+    tabA.close();
+    assert.equal(events.listenerCount(), 0);
+  });
+
+  it("ignores a corrupt storage value", () => {
+    const { events, tabA, tabB } = twoTabs();
+    try {
+      const accept = createRegistryChangeFilter();
+      let acted = 0;
+      tabB.subscribe((event) => {
+        if (accept(event)) acted += 1;
+      });
+      events.emit({ key: TAB_SYNC_STORAGE_KEY, newValue: "{not json" });
+      events.emit({
+        key: TAB_SYNC_STORAGE_KEY,
+        newValue: JSON.stringify({
+          nonce: "n",
+          event: registryEvent({ payload: { v: 1, kind: "x", revision: 1 } }),
+        }),
+      });
+      assert.equal(acted, 0);
+    } finally {
+      tabA.close();
+      tabB.close();
     }
   });
 });

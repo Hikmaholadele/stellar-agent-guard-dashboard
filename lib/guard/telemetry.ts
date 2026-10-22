@@ -32,7 +32,12 @@ import {
 import { scValToNative, xdr, type rpc } from "@stellar/stellar-sdk";
 import { NETWORK } from "./network.ts";
 import { withTimeout } from "./timeout.ts";
-import { estimateLedgerAtTime, type LedgerAnchor, type TimeRange } from "./ledgerTime.ts";
+import {
+  AVERAGE_LEDGER_CLOSE_SECS,
+  estimateLedgerAtTime,
+  type LedgerAnchor,
+  type TimeRange,
+} from "./ledgerTime.ts";
 
 /**
  * The event exactly as the chain encoded it, kept next to the SDK's decoding.
@@ -69,7 +74,153 @@ export type TelemetryEvent = GuardEvent & {
 /** One page of rows, carrying the SDK's own page fields (cursor, ledgers). */
 export type TelemetryPage = Omit<PollResult, "events"> & {
   events: TelemetryEvent[];
+  /** What this feed currently knows about holes in its coverage. */
+  gaps?: FeedGapState;
 };
+
+// ── Coverage gaps ──────────────────────────────────────────────────────────
+//
+// A feed that looks complete when it is not is worse than one that says so. The
+// RPC reports, on every response, the retention window it still holds and the
+// cursor to resume from, and those two facts are enough to notice some — not
+// all — ways the feed can have missed events. This section turns them into an
+// explicit notice. It never fabricates an event for a hole, and it never reads
+// an empty page as either "nothing happened" or "something was lost": only the
+// retention window and the cursor decide.
+
+export type FeedGapReason =
+  /** The RPC's retention window moved past ledgers this feed had not read yet. */
+  | "history_pruned"
+  /** The RPC handed back a cursor earlier than the one this feed already held. */
+  | "cursor_regressed";
+
+export interface FeedGap {
+  reason: FeedGapReason;
+  /** First ledger that could not be read (inclusive); `null` when the range is unknown. */
+  fromLedger: number | null;
+  /** Last ledger that could not be read (inclusive); `null` when the range is unknown. */
+  toLedger: number | null;
+  /** The newest ledger the RPC reported in the response that exposed this. */
+  detectedAtLedger: number;
+}
+
+export interface FeedGapState {
+  /** Unrecoverable holes, oldest first. They stay until the feed is restarted. */
+  lost: FeedGap[];
+  /** A discontinuity seen on the latest poll only; cleared by the next clean one. */
+  unsettled: FeedGap | null;
+}
+
+export const EMPTY_FEED_GAP_STATE: FeedGapState = { lost: [], unsettled: null };
+
+/** Cap on remembered lost ranges, so a long-running tab cannot grow without bound. */
+export const FEED_GAP_LIMIT = 20;
+
+/**
+ * Compare two RPC event cursors. stellar-rpc ids are `<TOID>-<event index>`, both
+ * decimal, so they compare numerically — not as strings, whose order differs once
+ * the digit counts differ. `null` when either is not in that shape: an
+ * unrecognised cursor can be neither trusted nor shown to have regressed.
+ */
+export function compareEventCursor(a: string, b: string): -1 | 0 | 1 | null {
+  const left = /^(\d+)-(\d+)$/.exec(a);
+  const right = /^(\d+)-(\d+)$/.exec(b);
+  if (!left || !right) return null;
+  const leftPos = [BigInt(left[1]!), BigInt(left[2]!)] as const;
+  const rightPos = [BigInt(right[1]!), BigInt(right[2]!)] as const;
+  for (let i = 0; i < 2; i += 1) {
+    if (leftPos[i]! < rightPos[i]!) return -1;
+    if (leftPos[i]! > rightPos[i]!) return 1;
+  }
+  return 0;
+}
+
+export interface FeedPollEvidence {
+  /** The earliest ledger this feed has not yet confirmed reading; `null` before it has one. */
+  expectedFrom: number | null;
+  /** The last known-good cursor, if any. */
+  heldCursor: string | null;
+  page: { cursor: string; latestLedger: number; oldestLedger: number | null };
+}
+
+/**
+ * The discontinuities one poll response proves.
+ *
+ * - `history_pruned`: the earliest ledger still owed to the operator is older
+ *   than the oldest ledger the RPC retains, so ledgers `expectedFrom` through
+ *   `oldestLedger - 1` can no longer be fetched. The same rule the SDK's
+ *   `follow()` applies. Skipped when the RPC omits `oldestLedger` rather than
+ *   guessing a boundary.
+ * - `cursor_regressed`: the response's cursor is earlier than the held one. The
+ *   range is unknown, because a regression says the position is unreliable, not
+ *   which events fell in between.
+ *
+ * Whether the page has events is deliberately not an input.
+ */
+export function detectFeedGaps(evidence: FeedPollEvidence): FeedGap[] {
+  const { expectedFrom, heldCursor, page } = evidence;
+  const found: FeedGap[] = [];
+  if (expectedFrom !== null && page.oldestLedger !== null && expectedFrom < page.oldestLedger) {
+    found.push({
+      reason: "history_pruned",
+      fromLedger: expectedFrom,
+      toLedger: page.oldestLedger - 1,
+      detectedAtLedger: page.latestLedger,
+    });
+  }
+  if (heldCursor && page.cursor && compareEventCursor(page.cursor, heldCursor) === -1) {
+    found.push({
+      reason: "cursor_regressed",
+      fromLedger: null,
+      toLedger: null,
+      detectedAtLedger: page.latestLedger,
+    });
+  }
+  return found;
+}
+
+/** "5 minutes", "2 hours", "3 days" — coarse on purpose; ledger times are an estimate. */
+function approximateDuration(totalSecs: number): string {
+  const minutes = Math.round(totalSecs / 60);
+  if (totalSecs < 90) return `${Math.max(1, Math.round(totalSecs))} seconds`;
+  if (minutes < 90) return `${minutes} minutes`;
+  const hours = Math.round(totalSecs / 3600);
+  if (hours < 48) return `${hours} hours`;
+  return `${Math.round(totalSecs / 86_400)} days`;
+}
+
+/** Operator-facing copy for one gap: what happened and exactly what range it covers. */
+export function describeFeedGap(gap: FeedGap): { headline: string; range: string } {
+  if (gap.reason === "history_pruned" && gap.fromLedger !== null && gap.toLedger !== null) {
+    const ledgers = gap.toLedger - gap.fromLedger + 1;
+    const span = approximateDuration(ledgers * AVERAGE_LEDGER_CLOSE_SECS);
+    return {
+      headline: "Events were missed and cannot be recovered from this RPC",
+      range: `Ledgers ${gap.fromLedger}–${gap.toLedger} (about ${span}) are no longer retained.`,
+    };
+  }
+  return {
+    headline: "The RPC returned an earlier position than this feed had already reached",
+    range: "The affected range is unknown. The feed kept its last known-good position.",
+  };
+}
+
+/**
+ * The earliest ledger still unconfirmed after a page. A page that reached the head
+ * confirms everything up to `latestLedger`; a full page (more to come) confirms
+ * only through its last event, so the boundary check stays armed for the next poll.
+ * Same rule as the SDK's `follow()`.
+ */
+function nextExpectedLedger(
+  page: { events: readonly { ledger: number | null }[]; latestLedger: number },
+  limit: number,
+): number {
+  const ledgers = page.events
+    .map((event) => event.ledger)
+    .filter((ledger): ledger is number => ledger !== null);
+  if (page.events.length >= limit && ledgers.length > 0) return Math.max(...ledgers) + 1;
+  return page.latestLedger + 1;
+}
 
 /**
  * A cursor-carrying reader over one guard's event stream.
@@ -92,6 +243,10 @@ export class GuardFeed {
   private readonly listener: GuardTelemetryListener;
   private cursor: string | null = null;
   private latestLedger: number | null = null;
+  /** The earliest ledger not yet confirmed read; the boundary gap detection checks. */
+  private expectedFrom: number | null = null;
+  private lostGaps: FeedGap[] = [];
+  private unsettledGap: FeedGap | null = null;
 
   /** The raw `getEvents` page behind the most recent poll, captured for `raw`. */
   private lastRawEvents: readonly rpc.Api.EventResponse[] = [];
@@ -143,11 +298,31 @@ export class GuardFeed {
       this.lastRawEvents = [];
       const decoded = await this.listener.poll(params);
       const page = { ...decoded, events: attachLedgerXdr(decoded.events, this.lastRawEvents) };
+
+      // Look for discontinuities before moving any pointer, against where the
+      // feed was. Received events are never dropped for it: the page is returned
+      // whole and the stream buffer de-duplicates anything it already holds.
+      const found = detectFeedGaps({
+        expectedFrom: this.expectedFrom,
+        heldCursor: this.cursor,
+        page: {
+          cursor: page.cursor,
+          latestLedger: page.latestLedger,
+          oldestLedger: page.oldestLedger,
+        },
+      });
+      this.recordGaps(found);
+
       // A page with no events still advances the ledger pointer, so the next poll
       // does not re-scan a stretch of empty ledgers.
       this.latestLedger = Math.max(this.latestLedger ?? 0, page.latestLedger);
-      if (page.cursor) this.cursor = page.cursor;
-      return page;
+      // The cursor only ever moves forward. A regressed one is not adopted, so the
+      // next poll resumes from the last known-good position.
+      if (page.cursor && !found.some((gap) => gap.reason === "cursor_regressed")) {
+        this.cursor = page.cursor;
+      }
+      this.expectedFrom = Math.max(this.expectedFrom ?? 0, nextExpectedLedger(page, limit));
+      return { ...page, gaps: this.gapState() };
     });
   }
 
@@ -156,10 +331,31 @@ export class GuardFeed {
     return { cursor: this.cursor, latestLedger: this.latestLedger };
   }
 
+  /** What this feed knows about holes in its coverage, as of the last poll. */
+  gapState(): FeedGapState {
+    return { lost: [...this.lostGaps], unsettled: this.unsettledGap };
+  }
+
   /** Forget the cursor so the feed re-scans from a given ledger. */
   resetFrom(ledger: number | null): void {
     this.cursor = null;
     this.latestLedger = ledger;
+    // A new starting point is a new baseline: what is owed begins at `ledger`, and
+    // notices about the old position no longer describe this feed.
+    this.expectedFrom = ledger;
+    this.lostGaps = [];
+    this.unsettledGap = null;
+  }
+
+  private recordGaps(found: readonly FeedGap[]): void {
+    this.unsettledGap = found.find((gap) => gap.reason === "cursor_regressed") ?? null;
+    for (const gap of found) {
+      if (gap.reason !== "history_pruned") continue;
+      const known = this.lostGaps.some(
+        (lost) => lost.fromLedger === gap.fromLedger && lost.toLedger === gap.toLedger,
+      );
+      if (!known) this.lostGaps = [...this.lostGaps, gap].slice(-FEED_GAP_LIMIT);
+    }
   }
 
   /**

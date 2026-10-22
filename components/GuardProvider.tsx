@@ -44,8 +44,19 @@ import {
   type StreamBuffer,
   type TelemetryEvent,
 } from "../lib/guard/telemetry.ts";
-import { FEED_GUARD_CAP, MultiGuardFeed, type FeedSource } from "../lib/guard/feedSubscriptions.ts";
-import { createTabSync, type TabSyncEventType } from "../lib/guard/tabSync.ts";
+import {
+  FEED_GUARD_CAP,
+  MultiGuardFeed,
+  feedGapNotices,
+  type FeedGapNotice,
+  type FeedSource,
+} from "../lib/guard/feedSubscriptions.ts";
+import {
+  createRegistryAnnouncer,
+  createRegistryChangeFilter,
+  createTabSync,
+  type TabSyncEventType,
+} from "../lib/guard/tabSync.ts";
 import { resolveGuardFromSearch } from "../lib/guard/deeplink.ts";
 import {
   decodeUrlState,
@@ -63,7 +74,7 @@ import {
   renameInstance as renameSavedInstance,
   type GuardInstance,
 } from "../lib/guard/instance.ts";
-import { addGuard } from "../lib/guard/registry.ts";
+import { addGuard, fallbackAfterRemoval, registryAfterChange } from "../lib/guard/registry.ts";
 import { readStatus, readPolicy, readWindow, verifyWasmIdentity } from "../lib/guard/chain.ts";
 import { currentAddress, freighterSigner, type ConnectedWallet } from "../lib/guard/wallet.ts";
 import {
@@ -186,6 +197,11 @@ export interface GuardContextValue {
     capped: number;
     /** Labels of the excluded guards, so the cap can be named, not just counted. */
     cappedLabels: string[];
+    /**
+     * Guards whose feed has a known hole or an unsettled position. Empty does
+     * not mean complete — only that no discontinuity has been detected.
+     */
+    gaps: FeedGapNotice[];
   };
   startWatching: () => void;
   stopWatching: () => void;
@@ -218,7 +234,15 @@ export interface GuardContextValue {
    * Tell the other open tabs that this one changed something. The provider adds
    * the active guard, so callers only name the change.
    */
-  notifyTabs: (type: TabSyncEventType, options?: { payload?: Record<string, unknown> }) => void;
+  /**
+   * Tell the other tabs something changed. `guard` names the guard the change was
+   * made to; it defaults to the active one, which is wrong for a write that
+   * settled after the operator had moved on.
+   */
+  notifyTabs: (
+    type: TabSyncEventType,
+    options?: { guard?: string; payload?: Record<string, unknown> },
+  ) => void;
   /** Operator session auto-lock state and its configuration. */
   session: {
     state: IdleState;
@@ -261,6 +285,12 @@ export function GuardProvider({
   // localStorage fallback) and inert where neither exists, so the provider never
   // branches on availability. Created once per tab.
   const tabSync = useMemo(() => createTabSync(), []);
+  // Registry changes made here are announced to the other tabs, and the ones
+  // they announce are filtered through a per-tab replay guard. Each is created
+  // once per tab, so a re-render can never register a second listener or reset
+  // the revision counter that duplicate suppression depends on.
+  const announceRegistry = useMemo(() => createRegistryAnnouncer(tabSync), [tabSync]);
+  const registryChangeFilter = useMemo(() => createRegistryChangeFilter(), []);
   // Demo mode is settled synchronously from the build-time flag, then re-checked
   // for `?demo=true` in an effect — the query string is not visible during SSR,
   // and reading it during render would desynchronise hydration.
@@ -309,6 +339,7 @@ export function GuardProvider({
     guards: [],
     capped: 0,
     cappedLabels: [],
+    gaps: [],
   });
 
   /**
@@ -385,6 +416,12 @@ export function GuardProvider({
   useEffect(() => {
     guardRef.current = guard;
   }, [guard]);
+
+  // Demo mode, readable from the long-lived sync listener for the same reason.
+  const demoRef = useRef(demo);
+  useEffect(() => {
+    demoRef.current = demo;
+  }, [demo]);
 
   // Monotonic read epoch: bumped whenever the active guard changes. A read that
   // started under guard A and resolves after the switch to B is dropped instead
@@ -655,9 +692,9 @@ export function GuardProvider({
   }, [tabSync]);
 
   const notifyTabs = useCallback(
-    (type: TabSyncEventType, options?: { payload?: Record<string, unknown> }) => {
+    (type: TabSyncEventType, options?: { guard?: string; payload?: Record<string, unknown> }) => {
       tabSync.broadcast(type, {
-        guard: guardRef.current,
+        guard: options?.guard ?? guardRef.current,
         ...(options?.payload === undefined ? {} : { payload: options.payload }),
       });
     },
@@ -827,9 +864,39 @@ export function GuardProvider({
           setWallet(null);
           setNetworkMismatch(null);
           return;
+        case "REGISTRY_CHANGED": {
+          // The announcement says only that the saved registry changed; the
+          // list itself is re-read from storage here, never taken from the
+          // message. Demo mode pins a single fixture instance and ignores it.
+          if (demoRef.current) return;
+          const notice = registryChangeFilter(event);
+          if (notice === null) return;
+          const saved = loadInstances();
+          const activeGuard = guardRef.current;
+          setInstances((current) => registryAfterChange({ saved, current, activeGuard, notice }));
+          // The guard on screen was deleted in another tab: stop reading it and
+          // fall back the way a local delete does. This tab does not broadcast
+          // the fallback — the tab that deleted it already announced its own.
+          const fallback = fallbackAfterRemoval({
+            saved,
+            activeGuard,
+            notice,
+            defaultGuard: defaultGuard(),
+          });
+          if (fallback !== null) {
+            readEpochRef.current += 1;
+            setGuard(fallback);
+            setSnapshot(null);
+            setSnapshotError(null);
+            setBuffer(emptyStreamBuffer());
+            setRangeLabel(null);
+            dropFeedState();
+          }
+          return;
+        }
       }
     });
-  }, [tabSync, dropFeedState]);
+  }, [tabSync, dropFeedState, registryChangeFilter]);
 
   useEffect(() => {
     void refresh();
@@ -877,10 +944,13 @@ export function GuardProvider({
       setSnapshot(null);
       setSnapshotError(null);
       dropFeedState();
+      // Registry first: a tab that follows the selection must already know the
+      // guard it is being moved to.
+      announceRegistry("add", result.instance.guard);
       tabSync.broadcast("GUARD_CHANGED", { guard: result.instance.guard });
       return { ok: true };
     },
-    [server, demo, tabSync, dropFeedState],
+    [server, demo, tabSync, dropFeedState, announceRegistry],
   );
 
   const removeInstance = useCallback(
@@ -892,6 +962,8 @@ export function GuardProvider({
       // too, so re-adding the same address later starts clean rather than
       // resurrecting work the operator discarded with the guard.
       clearGuardScopedState(removed?.network ?? NETWORK.name, target);
+      // A build-seeded guard cannot be deleted, so nothing changed to announce.
+      if (remaining.length < instances.length) announceRegistry("remove", target);
       if (target === guard) {
         const fallback = remaining[0]?.guard ?? defaultGuard();
         readEpochRef.current += 1;
@@ -904,12 +976,17 @@ export function GuardProvider({
         tabSync.broadcast("GUARD_CHANGED", { guard: fallback });
       }
     },
-    [instances, guard, tabSync, dropFeedState],
+    [instances, guard, tabSync, dropFeedState, announceRegistry],
   );
 
-  const renameInstance = useCallback((target: string, label: string) => {
-    setInstances(renameSavedInstance(target, label));
-  }, []);
+  const renameInstance = useCallback(
+    (target: string, label: string) => {
+      setInstances(renameSavedInstance(target, label));
+      // A blank label is ignored by the rename, so there is nothing to announce.
+      if (label.trim() !== "") announceRegistry("rename", target);
+    },
+    [announceRegistry],
+  );
 
   const activeInstance = useMemo(
     () => instances.find((instance) => instance.guard === guard) ?? null,
@@ -995,6 +1072,7 @@ export function GuardProvider({
       guards: [],
       capped: 0,
       cappedLabels: [],
+      gaps: [],
     }));
   }, []);
 
@@ -1155,6 +1233,7 @@ export function GuardProvider({
           latestLedger: page.latestLedger ?? current.latestLedger,
           lastPolledAt: new Date().toISOString(),
           guards: supervisor.guards(),
+          gaps: feedGapNotices(page.watch),
           error: failed ? `${failed.label}: ${failed.error}` : null,
         }));
       } catch (error) {

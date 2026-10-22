@@ -73,6 +73,7 @@ const TEST_GUARD = {
     guards: [],
     capped: 0,
     cappedLabels: [],
+    gaps: [],
   },
   startWatching: () => {},
   stopWatching: () => {},

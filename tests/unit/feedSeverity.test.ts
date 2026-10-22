@@ -142,6 +142,7 @@ function contextFor() {
       guards: [],
       capped: 0,
       cappedLabels: [],
+      gaps: [],
     },
     stream: { paused: false, pendingCount: 0, dropped: 0 },
     startWatching: () => {},

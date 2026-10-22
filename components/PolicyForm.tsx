@@ -1,13 +1,17 @@
 "use client";
 
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useFormValidation } from "../lib/guard/useFormValidation.ts";
 import type { PolicyDraft } from "../lib/guard/policyForm.ts";
 import {
   EMPTY_DRAFT,
   buildPolicyConfig,
   describeDraft,
   draftFromConfig,
+  policyDraftsEqual,
+  validatePolicyDraftFields,
 } from "../lib/guard/policyForm.ts";
+import { useUnsavedChangesWarning } from "../lib/guard/useUnsavedChangesWarning.ts";
 import {
   POLICY_PRESETS,
   SECURITY_PROFILES,
@@ -41,12 +45,21 @@ import {
   type AssetCapChange,
 } from "../lib/guard/assetCapsCsv.ts";
 import { useGuard } from "./GuardProvider.tsx";
-import { ErrorBlock, ScopeNotice, WarningBanner, starLink } from "./bits.tsx";
+import { ErrorBlock, ScopeNotice, WarningBanner, short, starLink } from "./bits.tsx";
 import { ProtocolFunctionSelector } from "./ProtocolFunctionSelector.tsx";
 import { CsvImportExport } from "./CsvImportExport.tsx";
 import { PolicySimulationView } from "./PolicySimulationView.tsx";
 import { fetchTokenMetadata } from "../lib/guard/tokenMetadata.ts";
 import { writeControlState } from "../lib/guard/observerMode.ts";
+import {
+  bindToScope,
+  guardScope,
+  runScopedWrite,
+  sameGuardScope,
+  valueInScope,
+  type GuardScope,
+  type ScopeBound,
+} from "../lib/guard/guardScoped.ts";
 import { useToast } from "../lib/guard/useToast.ts";
 import { exportPolicyDraft, importPolicyFromJson } from "../lib/guard/policySchema.ts";
 
@@ -60,6 +73,13 @@ import { exportPolicyDraft, importPolicyFromJson } from "../lib/guard/policySche
  */
 type PolicyOutcome =
   { kind: "invalid"; issues: string[] } | { kind: "invoked"; result: InvokeResult };
+
+/**
+ * What an operator approved: the draft as it stood, and the diff they were shown
+ * (none for an export, which writes nothing). It is bound to the guard it was
+ * produced for, so it can only ever be spent on that guard.
+ */
+type PolicyApproval = ScopeBound<{ draft: PolicyDraft; diff: PolicyDiff | null }>;
 
 /** Speak a policy write's outcome, with the reason when it did not land. */
 function speakPolicy(operation: PolicyOperation, reason: string, guard?: string): void {
@@ -119,8 +139,8 @@ export function PolicyForm() {
   // the operator's first keystroke takes over from it.
   const {
     state: draft,
-    push: setDraft,
-    edit: editDraft,
+    push: pushDraft,
+    edit: editDraftRaw,
     undo,
     redo,
     canUndo,
@@ -133,12 +153,69 @@ export function PolicyForm() {
   usePwaActivity(busy, "write");
   const [outcome, setOutcome] = useState<PolicyOutcome | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [pendingDiff, setPendingDiff] = useState<PolicyDiff | null>(null);
+  // The approval behind the open diff dialog, bound to the guard it was computed
+  // for. A stale one is unreachable (see `approval` below), and is cleared outright
+  // when the active guard changes.
+  const [pendingApproval, setPendingApproval] = useState<PolicyApproval | null>(null);
   const [assetCapChanges, setAssetCapChanges] = useState<Record<string, AssetCapChange>>({});
   // A preset is applied in two steps: choosing one stages it here, and the
   // confirmation dialog applies it. The draft is never replaced by a stray
   // change event on the select.
   const [pendingPreset, setPendingPreset] = useState<PolicyPreset | null>(null);
+  // ── Which guard everything on this form belongs to ──────────────────────
+  // The active guard is shared application context: the operator, another tab or
+  // a link can change it while a draft, an approval or a write is still live.
+  // The scope is read through a ref wherever it must reflect "now" — inside an
+  // async write — and through render values everywhere else.
+  const activeScope = guardScope(guard);
+  const guardRef = useRef(guard);
+  useEffect(() => {
+    guardRef.current = guard;
+  }, [guard]);
+  const nowScope = () => guardScope(guardRef.current);
+  // The guard (and network) the unsaved draft was started for.
+  const [draftScope, setDraftScope] = useState<GuardScope | null>(null);
+  // An unsaved draft that belongs to a different guard than the one now selected.
+  // It is held, not applied and not dropped: the operator discards it explicitly
+  // or switches back to it.
+  const draftForOtherGuard =
+    draft !== null && draftScope !== null && !sameGuardScope(draftScope, activeScope);
+  const [seenScope, setSeenScope] = useState<GuardScope>(activeScope);
+  if (!sameGuardScope(seenScope, activeScope)) {
+    // The guard changed. Everything that was produced for the previous one — the
+    // open approval, its outcome and error, a staged preset — is invalidated
+    // here, during the render that first sees the new guard, so none of it is ever
+    // shown (or confirmable) against the new one, even if the operator switches back.
+    setSeenScope(activeScope);
+    setPendingApproval(null);
+    setOutcome(null);
+    setError(null);
+    setPendingPreset(null);
+    setAssetCapChanges({});
+  }
+  const approval = valueInScope(pendingApproval, activeScope);
+
+  /** Replace the draft. Refused while the draft belongs to another guard. */
+  function setDraft(next: PolicyDraft | null) {
+    if (draftForOtherGuard) return;
+    pushDraft(next);
+    setDraftScope(next === null ? null : activeScope);
+  }
+
+  /** Coalesced text edit. Refused while the draft belongs to another guard. */
+  function editDraft(next: PolicyDraft) {
+    if (draftForOtherGuard) return;
+    editDraftRaw(next);
+    setDraftScope(activeScope);
+  }
+
+  /** The explicit discard: the only way an edit for another guard is dropped. */
+  function discardOtherGuardDraft() {
+    pushDraft(null);
+    setDraftScope(null);
+    setAssetCapChanges({});
+  }
+
   const csvInput = useRef<HTMLInputElement>(null);
   const jsonInput = useRef<HTMLInputElement>(null);
   const policyJsonInput = useRef<HTMLInputElement>(null);
@@ -212,10 +289,18 @@ export function PolicyForm() {
     snapshot?.policy.ok && snapshot.policy.value !== null
       ? draftFromConfig(snapshot.policy.value)
       : EMPTY_DRAFT;
-  const effective = draft ?? installedDraft;
+  // A draft for another guard is never shown as this guard's form: the form falls
+  // back to what is actually installed here.
+  const effective = draft !== null && !draftForOtherGuard ? draft : installedDraft;
 
   const validation = buildPolicyConfig(effective);
   const issues = validation.ok ? [] : validation.issues;
+  const fieldErrors = useFormValidation(effective, validatePolicyDraftFields);
+  // A draft that has been typed back to exactly what is installed loses
+  // nothing on navigation, so it is not unsaved work. Held drafts for another
+  // guard always are: they are not shown here and would not be re-created.
+  const isDirty = draft !== null && !policyDraftsEqual(draft, installedDraft);
+  useUnsavedChangesWarning(isDirty);
 
   // Nothing installed is default-deny, not a blank slate: the form is where that
   // state gets named before the operator is asked to fill anything in.
@@ -225,12 +310,12 @@ export function PolicyForm() {
   // other write control in the console (issue #101).
   const installControl = writeControlState(wallet, {
     busy,
-    extraDisabled: issues.length > 0,
+    extraDisabled: issues.length > 0 || draftForOtherGuard,
     label: "install the policy",
   });
   const exportControl = writeControlState(wallet, {
     busy,
-    extraDisabled: issues.length > 0,
+    extraDisabled: issues.length > 0 || draftForOtherGuard,
     label: "export the policy",
   });
   const revokeControl = writeControlState(wallet, { busy, label: "revoke the policy" });
@@ -326,87 +411,131 @@ export function PolicyForm() {
    * and needs no confirmation.
    */
   async function submit(exportOnly = false) {
+    if (draftForOtherGuard) return;
     if (!exportOnly) {
       if (!validation.ok) return;
       const installed =
         snapshot?.policy.ok && snapshot.policy.value !== null ? snapshot.policy.value : null;
-      setPendingDiff(computePolicyDiff(installed, validation.config));
+      // The approval carries the draft it was shown for and the guard it is for.
+      setPendingApproval(
+        bindToScope(activeScope, {
+          draft: effective,
+          diff: computePolicyDiff(installed, validation.config),
+        }),
+      );
       return;
     }
-    await runInstall(true);
+    await runInstall(true, bindToScope(activeScope, { draft: effective, diff: null }));
   }
 
-  async function runInstall(exportOnly = false) {
-    setPendingDiff(null);
+  /**
+   * Spend an approval. The write is built for the guard the approval was made for,
+   * never for whichever guard is selected by the time this runs, and it does not
+   * start at all if that guard is no longer the active one.
+   */
+  async function runInstall(exportOnly: boolean, approved: PolicyApproval | null) {
+    setPendingApproval(null);
+    if (!approved) return;
     setBusy(true);
     setError(null);
     setOutcome(null);
+    const approvedGuard = approved.scope.guard;
     try {
-      const result = await installPolicy({
-        server,
-        signer: signer(),
-        guard,
-        draft: effective,
-        exportOnly,
+      const run = await runScopedWrite({
+        approval: approved.scope,
+        activeScope: nowScope,
+        write: (target) =>
+          installPolicy({
+            server,
+            signer: signer(),
+            guard: target,
+            draft: approved.value.draft,
+            exportOnly,
+          }),
       });
-      setOutcome(result);
+      if (run.kind === "stale") {
+        // The guard changed before anything was built: no transaction exists.
+        const reason = "the active guard changed, so nothing was signed or submitted";
+        setError(`The policy was not written: ${reason}. Review it again for this guard.`);
+        speakPolicy("set_policy", reason, approvedGuard);
+        return;
+      }
+      const result = run.result;
+      if (run.stillActive) setOutcome(result);
       if (result.kind === "invoked" && result.result.kind === "refused") {
-        pushEvents(refusedEventsFromDiagnostics(result.result.diagnosticEvents, guard));
+        pushEvents(refusedEventsFromDiagnostics(result.result.diagnosticEvents, approvedGuard));
       }
       // Announce only a write that reached the chain; a refused call changed
-      // nothing, so there is nothing for the other tabs to re-read.
+      // nothing, so there is nothing for the other tabs to re-read. The event
+      // names the guard that was written, not the one now on screen.
       if (result.kind === "invoked" && result.result.kind === "submitted") {
-        notifyTabs("POLICY_UPDATED", { payload: { operation: "set_policy" } });
+        notifyTabs("POLICY_UPDATED", {
+          guard: approvedGuard,
+          payload: { operation: "set_policy" },
+        });
       }
-      speakPolicyOutcome("set_policy", result, exportOnly, guard ?? undefined);
-      if (!exportOnly) {
+      speakPolicyOutcome("set_policy", result, exportOnly, approvedGuard);
+      if (!exportOnly && run.stillActive) {
         await refresh();
       }
     } catch (caught) {
       const detail = caught instanceof Error ? caught.message : String(caught);
-      setError(detail);
-      speakPolicy("set_policy", detail, guard ?? undefined);
+      // A failure belongs to the guard that was written; show it only there.
+      if (sameGuardScope(approved.scope, nowScope())) setError(detail);
+      speakPolicy("set_policy", detail, approvedGuard);
     } finally {
       setBusy(false);
     }
   }
 
   async function revoke(exportOnly = false) {
+    // A revoke is a single click on the guard in front of the operator, so the
+    // approval is that guard, taken now.
+    const approved = activeScope;
     setBusy(true);
     setError(null);
     setOutcome(null);
     try {
-      const result = await revokePolicy({ server, signer: signer(), guard, exportOnly });
-      setOutcome({ kind: "invoked", result });
-      if (result.kind === "submitted") {
-        notifyTabs("POLICY_UPDATED", { payload: { operation: "revoke_policy" } });
+      const run = await runScopedWrite({
+        approval: approved,
+        activeScope: nowScope,
+        write: (target) => revokePolicy({ server, signer: signer(), guard: target, exportOnly }),
+      });
+      if (run.kind === "stale") {
+        const reason = "the active guard changed, so nothing was signed or submitted";
+        setError(`The policy was not revoked: ${reason}.`);
+        speakPolicy("revoke_policy", reason, approved.guard);
+        return;
       }
-      speakPolicyOutcome(
-        "revoke_policy",
-        { kind: "invoked", result },
-        exportOnly,
-        guard ?? undefined,
-      );
-      if (!exportOnly) {
+      const result = run.result;
+      if (run.stillActive) setOutcome({ kind: "invoked", result });
+      if (result.kind === "submitted") {
+        notifyTabs("POLICY_UPDATED", {
+          guard: approved.guard,
+          payload: { operation: "revoke_policy" },
+        });
+      }
+      speakPolicyOutcome("revoke_policy", { kind: "invoked", result }, exportOnly, approved.guard);
+      if (!exportOnly && run.stillActive) {
         await refresh();
       }
     } catch (caught) {
       const detail = caught instanceof Error ? caught.message : String(caught);
-      setError(detail);
-      speakPolicy("revoke_policy", detail, guard ?? undefined);
+      if (sameGuardScope(approved, nowScope())) setError(detail);
+      speakPolicy("revoke_policy", detail, approved.guard);
     } finally {
       setBusy(false);
     }
   }
 
   function undoEdit() {
-    if (busy || !canUndo) return;
+    if (busy || !canUndo || draftForOtherGuard) return;
     undo();
     setAssetCapChanges({});
   }
 
   function redoEdit() {
-    if (busy || !canRedo) return;
+    if (busy || !canRedo || draftForOtherGuard) return;
     redo();
     setAssetCapChanges({});
   }
@@ -421,6 +550,23 @@ export function PolicyForm() {
     else redoEdit();
   }
 
+  function validationAttributes(field: keyof PolicyDraft) {
+    const error = fieldErrors[field];
+    return {
+      "aria-invalid": error ? true : undefined,
+      "aria-describedby": error ? `policy-error-${field}` : undefined,
+    };
+  }
+
+  function fieldError(field: keyof PolicyDraft) {
+    const error = fieldErrors[field];
+    return error ? (
+      <span className="field-error tiny" id={`policy-error-${field}`} role="status">
+        {error}
+      </span>
+    ) : null;
+  }
+
   return (
     <div className="panel" id="policy" onKeyDown={onKeyDown}>
       <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
@@ -430,7 +576,7 @@ export function PolicyForm() {
             className="secondary"
             type="button"
             onClick={undoEdit}
-            disabled={busy || !canUndo}
+            disabled={busy || !canUndo || draftForOtherGuard}
             title="Undo (Ctrl+Z / Cmd+Z)"
             aria-label="Undo"
           >
@@ -440,7 +586,7 @@ export function PolicyForm() {
             className="secondary"
             type="button"
             onClick={redoEdit}
-            disabled={busy || !canRedo}
+            disabled={busy || !canRedo || draftForOtherGuard}
             title="Redo (Ctrl+Shift+Z / Cmd+Shift+Z / Ctrl+Y)"
             aria-label="Redo"
           >
@@ -449,6 +595,25 @@ export function PolicyForm() {
         </div>
       </div>
       <ScopeNotice />
+
+      {draftForOtherGuard && draftScope && (
+        <div className="notice danger" role="alert" data-testid="other-guard-draft">
+          <strong>Unsaved edits belong to a different guard</strong>
+          <span className="tiny">
+            These edits were started for{" "}
+            <span className="mono">{short(draftScope.guard, 8, 6)}</span> ({draftScope.network}).
+            They have not been applied to the guard now selected (
+            <span className="mono">{short(guard, 8, 6)}</span>) and cannot be installed on it. The
+            form below shows what is installed on the selected guard. Switch back to continue
+            editing, or discard the edits.
+          </span>
+          <div className="row" style={{ marginTop: 6 }}>
+            <button className="secondary" onClick={discardOtherGuardDraft}>
+              Discard unsaved edits
+            </button>
+          </div>
+        </div>
+      )}
 
       {policyState === "default-deny" && (
         <WarningBanner
@@ -467,365 +632,392 @@ export function PolicyForm() {
         </WarningBanner>
       )}
 
-      <CsvImportExport />
-      <PolicySimulationView policy={validation.ok ? validation.config : null} />
-      <p className="tiny muted">
-        Installing a policy resets the rolling window and restarts the dead-man-switch clock, so a
-        freshly installed policy always starts with full grace.
-      </p>
+      <fieldset
+        disabled={draftForOtherGuard}
+        style={{ border: 0, padding: 0, margin: 0, minInlineSize: 0 }}
+      >
+        <CsvImportExport />
+        <PolicySimulationView policy={validation.ok ? validation.config : null} />
+        <p className="tiny muted">
+          Installing a policy resets the rolling window and restarts the dead-man-switch clock, so a
+          freshly installed policy always starts with full grace.
+        </p>
 
-      <div className="row" style={{ marginBottom: 14 }}>
-        <button
-          className="secondary"
-          type="button"
-          onClick={() => policyJsonInput.current?.click()}
-          disabled={busy}
-        >
-          Import Policy JSON
-        </button>
-        <button className="secondary" type="button" onClick={exportPolicyJson} disabled={busy}>
-          Export Policy JSON
-        </button>
-        <input
-          ref={policyJsonInput}
-          type="file"
-          accept=".json,application/json"
-          hidden
-          onChange={(event) => {
-            const file = event.target.files?.[0];
-            event.target.value = "";
-            if (file) void importPolicyJson(file);
-          }}
-        />
-      </div>
-
-      <div className="preset-picker">
-        <label className="field" style={{ maxWidth: 420 }}>
-          <span className="lbl">Policy presets</span>
-          <select
-            ref={presetSelect}
-            value=""
+        <div className="row" style={{ marginBottom: 14 }}>
+          <button
+            className="secondary"
+            type="button"
+            onClick={() => policyJsonInput.current?.click()}
             disabled={busy}
-            aria-label="Apply a policy preset"
-            onChange={(event) => {
-              const preset = policyPresetById(event.target.value);
-              if (preset) setPendingPreset(preset);
-            }}
           >
-            <option value="">Choose a vetted starting point…</option>
+            Import Policy JSON
+          </button>
+          <button className="secondary" type="button" onClick={exportPolicyJson} disabled={busy}>
+            Export Policy JSON
+          </button>
+          <input
+            ref={policyJsonInput}
+            type="file"
+            accept=".json,application/json"
+            hidden
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              event.target.value = "";
+              if (file) void importPolicyJson(file);
+            }}
+          />
+        </div>
+
+        <div className="preset-picker">
+          <label className="field" style={{ maxWidth: 420 }}>
+            <span className="lbl">Policy presets</span>
+            <select
+              ref={presetSelect}
+              value=""
+              disabled={busy}
+              aria-label="Apply a policy preset"
+              onChange={(event) => {
+                const preset = policyPresetById(event.target.value);
+                if (preset) setPendingPreset(preset);
+              }}
+            >
+              <option value="">Choose a vetted starting point…</option>
+              {POLICY_PRESETS.map((preset) => (
+                <option key={preset.id} value={preset.id}>
+                  {preset.name} — {SECURITY_PROFILES[preset.securityProfile].label}
+                </option>
+              ))}
+            </select>
+            <span className="hint">
+              Fills every field from a vetted archetype. You will be asked to confirm before your
+              current draft is replaced.
+            </span>
+          </label>
+          <div className="preset-legend">
             {POLICY_PRESETS.map((preset) => (
-              <option key={preset.id} value={preset.id}>
-                {preset.name} — {SECURITY_PROFILES[preset.securityProfile].label}
-              </option>
+              <div key={preset.id} className="tiny">
+                <SecurityProfileBadge profile={preset.securityProfile} />{" "}
+                <strong>{preset.name}</strong>
+                <span className="muted"> — {preset.explanation}</span>
+              </div>
             ))}
-          </select>
-          <span className="hint">
-            Fills every field from a vetted archetype. You will be asked to confirm before your
-            current draft is replaced.
-          </span>
-        </label>
-        <div className="preset-legend">
-          {POLICY_PRESETS.map((preset) => (
-            <div key={preset.id} className="tiny">
-              <SecurityProfileBadge profile={preset.securityProfile} />{" "}
-              <strong>{preset.name}</strong>
-              <span className="muted"> — {preset.explanation}</span>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      <div className="split" style={{ marginTop: 14 }}>
-        <div>
-          <label className="field">
-            <span className="lbl">Per-transaction cap (blank = off)</span>
-            <input
-              value={effective.perTxCap}
-              inputMode="numeric"
-              onChange={(event) => set("perTxCap", event.target.value, "text")}
-              placeholder="1000"
-            />
-            <span className="hint">Largest single SAC transfer the account will authorize.</span>
-          </label>
-
-          <label className="field">
-            <span className="lbl">Rolling-window cap (blank = off)</span>
-            <input
-              value={effective.windowCap}
-              inputMode="numeric"
-              onChange={(event) => set("windowCap", event.target.value, "text")}
-              placeholder="150"
-            />
-            <span className="hint">
-              Total spend allowed inside a genuinely rolling window — not a fixed bucket that
-              resets.
-            </span>
-          </label>
-
-          <label className="field">
-            <span className="lbl">Rolling-window length (seconds)</span>
-            <input
-              value={effective.windowSecs}
-              inputMode="numeric"
-              onChange={(event) => set("windowSecs", event.target.value, "text")}
-              placeholder="86400"
-            />
-            <span className="hint">How far back the rolling sum looks.</span>
-          </label>
-
-          <label className="field">
-            <span className="lbl">Dead-man grace (seconds, blank = off)</span>
-            <input
-              value={effective.dmsGraceSecs}
-              inputMode="numeric"
-              onChange={(event) => set("dmsGraceSecs", event.target.value, "text")}
-              placeholder="skip"
-            />
-            <span className="hint">
-              Freeze the account automatically if the agent has not heartbeated within this many
-              seconds.
-            </span>
-          </label>
-
-          <span className="lbl">Active from / until (unix seconds, blank = unrestricted)</span>
-          <div className="row form-inline-row" style={{ marginBottom: 12 }}>
-            <input
-              value={effective.activeFrom}
-              inputMode="numeric"
-              onChange={(event) => set("activeFrom", event.target.value, "text")}
-              placeholder="from"
-              aria-label="Active from"
-            />
-            <input
-              value={effective.activeUntil}
-              inputMode="numeric"
-              onChange={(event) => set("activeUntil", event.target.value, "text")}
-              placeholder="until"
-              aria-label="Active until"
-            />
           </div>
         </div>
 
-        <div>
-          <label className="field">
-            <span className="lbl">Assets — SAC token contracts (one per line)</span>
-            <textarea
-              rows={3}
-              value={effective.assets}
-              onChange={(event) => set("assets", event.target.value, "text")}
-              placeholder="CDCYDGBGS5AZ5BZS6XY2SK2PHJHSOEGTN3N4INCK34KF6GU2BGC7Z6MB"
-            />
-            <span className="hint">
-              Transfers of these tokens get full recipient and amount enforcement.
-            </span>
-          </label>
-
-          <div className="field">
-            <span className="lbl">Per-asset cap overrides</span>
-            <span className="hint">
-              Bulk-edit asset contract addresses and positive stroop caps. Imported rows are merged
-              by contract address.
-            </span>
-            <div className="row" style={{ margin: "8px 0" }}>
-              <button
-                className="secondary"
-                type="button"
-                onClick={() => csvInput.current?.click()}
-                disabled={busy}
-              >
-                Import CSV
-              </button>
-              <button
-                className="secondary"
-                type="button"
-                onClick={() => jsonInput.current?.click()}
-                disabled={busy}
-              >
-                Import JSON
-              </button>
-              <button
-                className="secondary"
-                type="button"
-                onClick={() =>
-                  downloadAssetCaps(
-                    "asset-cap-overrides.csv",
-                    exportAssetCapsCsv(effective.assetCaps),
-                  )
-                }
-                disabled={busy || effective.assetCaps.length === 0}
-              >
-                Export CSV
-              </button>
-              <button
-                className="secondary"
-                type="button"
-                onClick={() =>
-                  downloadAssetCaps(
-                    "asset-cap-overrides.json",
-                    exportAssetCapsJson(effective.assetCaps),
-                  )
-                }
-                disabled={busy || effective.assetCaps.length === 0}
-              >
-                Export JSON
-              </button>
+        <div className="split" style={{ marginTop: 14 }}>
+          <div>
+            <label className="field">
+              <span className="lbl">Per-transaction cap (blank = off)</span>
               <input
-                ref={csvInput}
-                type="file"
-                accept=".csv,text/csv"
-                hidden
-                onChange={(event) => {
-                  const file = event.target.files?.[0];
-                  event.target.value = "";
-                  if (file) void importAssetCaps(file, "csv");
-                }}
+                {...validationAttributes("perTxCap")}
+                value={effective.perTxCap}
+                inputMode="numeric"
+                onChange={(event) => set("perTxCap", event.target.value, "text")}
+                placeholder="1000"
               />
+              {fieldError("perTxCap")}
+              <span className="hint">Largest single SAC transfer the account will authorize.</span>
+            </label>
+
+            <label className="field">
+              <span className="lbl">Rolling-window cap (blank = off)</span>
               <input
-                ref={jsonInput}
-                type="file"
-                accept=".json,application/json"
-                hidden
-                onChange={(event) => {
-                  const file = event.target.files?.[0];
-                  event.target.value = "";
-                  if (file) void importAssetCaps(file, "json");
-                }}
+                {...validationAttributes("windowCap")}
+                value={effective.windowCap}
+                inputMode="numeric"
+                onChange={(event) => set("windowCap", event.target.value, "text")}
+                placeholder="150"
               />
-            </div>
-            {effective.assetCaps.length > 0 && (
-              <table className="asset-caps">
-                <thead>
-                  <tr>
-                    <th>Asset contract</th>
-                    <th>Max cap (stroops)</th>
-                    <th>Symbol</th>
-                    <th aria-label="Actions" />
-                  </tr>
-                </thead>
-                <tbody>
-                  {effective.assetCaps.map((row, index) => (
-                    <tr key={row.assetContractAddress}>
-                      <td>
-                        <input
-                          aria-label={`Asset contract ${index + 1}`}
-                          value={row.assetContractAddress}
-                          onChange={(event) => {
-                            const next = [...effective.assetCaps];
-                            next[index] = { ...row, assetContractAddress: event.target.value };
-                            updateAssetCaps(next, "text");
-                          }}
-                        />
-                        {assetCapChanges[row.assetContractAddress] && (
-                          <span className="pill ok asset-cap-badge">
-                            {assetCapChanges[row.assetContractAddress]}
-                          </span>
-                        )}
-                      </td>
-                      <td>
-                        <input
-                          aria-label={`Maximum cap ${index + 1}`}
-                          inputMode="numeric"
-                          value={row.maxCapStroops}
-                          onChange={(event) => {
-                            const next = [...effective.assetCaps];
-                            next[index] = { ...row, maxCapStroops: event.target.value };
-                            updateAssetCaps(next, "text");
-                          }}
-                        />
-                      </td>
-                      <td>
-                        <input
-                          aria-label={`Symbol ${index + 1}`}
-                          value={row.symbol}
-                          onChange={(event) => {
-                            const next = [...effective.assetCaps];
-                            next[index] = { ...row, symbol: event.target.value };
-                            updateAssetCaps(next, "text");
-                          }}
-                        />
-                      </td>
-                      <td>
-                        <button
-                          className="secondary"
-                          type="button"
-                          aria-label={`Remove ${row.symbol || "asset override"}`}
-                          onClick={() =>
-                            updateAssetCaps(
-                              effective.assetCaps.filter((_, itemIndex) => itemIndex !== index),
-                            )
-                          }
-                        >
-                          Remove
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-          </div>
-
-          <label className="field">
-            <span className="lbl">Recipients (one per line)</span>
-            <textarea
-              rows={3}
-              value={effective.recipients}
-              onChange={(event) => set("recipients", event.target.value, "text")}
-              placeholder="GAOBCRXTCO4ZCBNHALJUMJJ5JDXNOUZ7U6VZJX4UBTXAHQEO66IPU6PH"
-            />
-          </label>
-
-          <div className="checkline">
-            <input
-              id="allow-any"
-              type="checkbox"
-              checked={effective.allowAnyRecipient}
-              onChange={(event) => set("allowAnyRecipient", event.target.checked)}
-            />
-            <label htmlFor="allow-any">
-              Allow any recipient (the caps still apply)
+              {fieldError("windowCap")}
               <span className="hint">
-                With this off, a transfer to an address that is not listed is refused.
+                Total spend allowed inside a genuinely rolling window — not a fixed bucket that
+                resets.
               </span>
             </label>
+
+            <label className="field">
+              <span className="lbl">Rolling-window length (seconds)</span>
+              <input
+                {...validationAttributes("windowSecs")}
+                value={effective.windowSecs}
+                inputMode="numeric"
+                onChange={(event) => set("windowSecs", event.target.value, "text")}
+                placeholder="86400"
+              />
+              {fieldError("windowSecs")}
+              <span className="hint">How far back the rolling sum looks.</span>
+            </label>
+
+            <label className="field">
+              <span className="lbl">Dead-man grace (seconds, blank = off)</span>
+              <input
+                {...validationAttributes("dmsGraceSecs")}
+                value={effective.dmsGraceSecs}
+                inputMode="numeric"
+                onChange={(event) => set("dmsGraceSecs", event.target.value, "text")}
+                placeholder="skip"
+              />
+              {fieldError("dmsGraceSecs")}
+              <span className="hint">
+                Freeze the account automatically if the agent has not heartbeated within this many
+                seconds.
+              </span>
+            </label>
+
+            <span className="lbl">Active from / until (unix seconds, blank = unrestricted)</span>
+            <div className="row form-inline-row" style={{ marginBottom: 12 }}>
+              <input
+                {...validationAttributes("activeFrom")}
+                value={effective.activeFrom}
+                inputMode="numeric"
+                onChange={(event) => set("activeFrom", event.target.value, "text")}
+                placeholder="from"
+                aria-label="Active from"
+              />
+              <input
+                {...validationAttributes("activeUntil")}
+                value={effective.activeUntil}
+                inputMode="numeric"
+                onChange={(event) => set("activeUntil", event.target.value, "text")}
+                placeholder="until"
+                aria-label="Active until"
+              />
+            </div>
+            {fieldError("activeFrom")}
+            {fieldError("activeUntil")}
           </div>
 
-          <label className="field">
-            <span className="lbl">Protocols — allowlisted contracts (one per line)</span>
-            <textarea
-              rows={3}
-              value={effective.protocols}
-              onChange={(event) => set("protocols", event.target.value, "text")}
-              placeholder="C…  or  C…:swap,deposit   (no colon = any function)"
-            />
-            <span className="hint">
-              Calls to contracts outside this list are refused. Window and pause state still apply
-              to these calls; per-call amount and recipient limits do not.
-            </span>
-          </label>
+          <div>
+            <label className="field">
+              <span className="lbl">Assets — SAC token contracts (one per line)</span>
+              <textarea
+                {...validationAttributes("assets")}
+                rows={3}
+                value={effective.assets}
+                onChange={(event) => set("assets", event.target.value, "text")}
+                placeholder="CDCYDGBGS5AZ5BZS6XY2SK2PHJHSOEGTN3N4INCK34KF6GU2BGC7Z6MB"
+              />
+              {fieldError("assets")}
+              <span className="hint">
+                Transfers of these tokens get full recipient and amount enforcement.
+              </span>
+            </label>
 
-          {/* The picker reads each contract's spec from chain, so a typo'd
+            <div className="field">
+              <span className="lbl">Per-asset cap overrides</span>
+              <span className="hint">
+                Bulk-edit asset contract addresses and positive stroop caps. Imported rows are
+                merged by contract address.
+              </span>
+              <div className="row" style={{ margin: "8px 0" }}>
+                <button
+                  className="secondary"
+                  type="button"
+                  onClick={() => csvInput.current?.click()}
+                  disabled={busy}
+                >
+                  Import CSV
+                </button>
+                <button
+                  className="secondary"
+                  type="button"
+                  onClick={() => jsonInput.current?.click()}
+                  disabled={busy}
+                >
+                  Import JSON
+                </button>
+                <button
+                  className="secondary"
+                  type="button"
+                  onClick={() =>
+                    downloadAssetCaps(
+                      "asset-cap-overrides.csv",
+                      exportAssetCapsCsv(effective.assetCaps),
+                    )
+                  }
+                  disabled={busy || effective.assetCaps.length === 0}
+                >
+                  Export CSV
+                </button>
+                <button
+                  className="secondary"
+                  type="button"
+                  onClick={() =>
+                    downloadAssetCaps(
+                      "asset-cap-overrides.json",
+                      exportAssetCapsJson(effective.assetCaps),
+                    )
+                  }
+                  disabled={busy || effective.assetCaps.length === 0}
+                >
+                  Export JSON
+                </button>
+                <input
+                  ref={csvInput}
+                  type="file"
+                  accept=".csv,text/csv"
+                  hidden
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    event.target.value = "";
+                    if (file) void importAssetCaps(file, "csv");
+                  }}
+                />
+                <input
+                  ref={jsonInput}
+                  type="file"
+                  accept=".json,application/json"
+                  hidden
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    event.target.value = "";
+                    if (file) void importAssetCaps(file, "json");
+                  }}
+                />
+              </div>
+              {effective.assetCaps.length > 0 && (
+                <table className="asset-caps">
+                  <thead>
+                    <tr>
+                      <th>Asset contract</th>
+                      <th>Max cap (stroops)</th>
+                      <th>Symbol</th>
+                      <th aria-label="Actions" />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {effective.assetCaps.map((row, index) => (
+                      <tr key={row.assetContractAddress}>
+                        <td>
+                          <input
+                            {...validationAttributes("assetCaps")}
+                            aria-label={`Asset contract ${index + 1}`}
+                            value={row.assetContractAddress}
+                            onChange={(event) => {
+                              const next = [...effective.assetCaps];
+                              next[index] = { ...row, assetContractAddress: event.target.value };
+                              updateAssetCaps(next, "text");
+                            }}
+                          />
+                          {assetCapChanges[row.assetContractAddress] && (
+                            <span className="pill ok asset-cap-badge">
+                              {assetCapChanges[row.assetContractAddress]}
+                            </span>
+                          )}
+                        </td>
+                        <td>
+                          <input
+                            {...validationAttributes("assetCaps")}
+                            aria-label={`Maximum cap ${index + 1}`}
+                            inputMode="numeric"
+                            value={row.maxCapStroops}
+                            onChange={(event) => {
+                              const next = [...effective.assetCaps];
+                              next[index] = { ...row, maxCapStroops: event.target.value };
+                              updateAssetCaps(next, "text");
+                            }}
+                          />
+                        </td>
+                        <td>
+                          <input
+                            {...validationAttributes("assetCaps")}
+                            aria-label={`Symbol ${index + 1}`}
+                            value={row.symbol}
+                            onChange={(event) => {
+                              const next = [...effective.assetCaps];
+                              next[index] = { ...row, symbol: event.target.value };
+                              updateAssetCaps(next, "text");
+                            }}
+                          />
+                        </td>
+                        <td>
+                          <button
+                            className="secondary"
+                            type="button"
+                            aria-label={`Remove ${row.symbol || "asset override"}`}
+                            onClick={() =>
+                              updateAssetCaps(
+                                effective.assetCaps.filter((_, itemIndex) => itemIndex !== index),
+                              )
+                            }
+                          >
+                            Remove
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+              {fieldError("assetCaps")}
+            </div>
+
+            <label className="field">
+              <span className="lbl">Recipients (one per line)</span>
+              <textarea
+                {...validationAttributes("recipients")}
+                rows={3}
+                value={effective.recipients}
+                onChange={(event) => set("recipients", event.target.value, "text")}
+                placeholder="GAOBCRXTCO4ZCBNHALJUMJJ5JDXNOUZ7U6VZJX4UBTXAHQEO66IPU6PH"
+              />
+              {fieldError("recipients")}
+            </label>
+
+            <div className="checkline">
+              <input
+                id="allow-any"
+                type="checkbox"
+                checked={effective.allowAnyRecipient}
+                onChange={(event) => set("allowAnyRecipient", event.target.checked)}
+              />
+              <label htmlFor="allow-any">
+                Allow any recipient (the caps still apply)
+                <span className="hint">
+                  With this off, a transfer to an address that is not listed is refused.
+                </span>
+              </label>
+            </div>
+
+            <label className="field">
+              <span className="lbl">Protocols — allowlisted contracts (one per line)</span>
+              <textarea
+                {...validationAttributes("protocols")}
+                rows={3}
+                value={effective.protocols}
+                onChange={(event) => set("protocols", event.target.value, "text")}
+                placeholder="C…  or  C…:swap,deposit   (no colon = any function)"
+              />
+              {fieldError("protocols")}
+              <span className="hint">
+                Calls to contracts outside this list are refused. Window and pause state still apply
+                to these calls; per-call amount and recipient limits do not.
+              </span>
+            </label>
+
+            {/* The picker reads each contract's spec from chain, so a typo'd
               symbol is caught before the policy is installed rather than as a
               runtime authorization refusal. The textarea stays authoritative:
               the picker only edits the lines it is given. */}
-          <ProtocolFunctionSelector draft={effective} set={set} />
+            <ProtocolFunctionSelector draft={effective} set={set} />
 
-          <div className="checkline">
-            <input
-              id="paused"
-              type="checkbox"
-              checked={effective.paused}
-              onChange={(event) => set("paused", event.target.checked)}
-            />
-            <label htmlFor="paused">
-              Start paused
-              <span className="hint">
-                Installs the policy but refuses every call until resumed.
-              </span>
-            </label>
+            <div className="checkline">
+              <input
+                id="paused"
+                type="checkbox"
+                checked={effective.paused}
+                onChange={(event) => set("paused", event.target.checked)}
+              />
+              <label htmlFor="paused">
+                Start paused
+                <span className="hint">
+                  Installs the policy but refuses every call until resumed.
+                </span>
+              </label>
+            </div>
           </div>
         </div>
-      </div>
+      </fieldset>
 
       <h3>Review</h3>
       <p className="tiny mono">{describeDraft(effective)}</p>
@@ -873,7 +1065,7 @@ export function PolicyForm() {
             setDraft(EMPTY_DRAFT);
             setAssetCapChanges({});
           }}
-          disabled={busy}
+          disabled={busy || draftForOtherGuard}
         >
           Clear form
         </button>
@@ -883,7 +1075,7 @@ export function PolicyForm() {
             setDraft(null);
             setAssetCapChanges({});
           }}
-          disabled={busy || draft === null}
+          disabled={busy || draft === null || draftForOtherGuard}
           title="Discard edits and load the policy currently installed on chain"
         >
           Load installed
@@ -936,11 +1128,11 @@ export function PolicyForm() {
         />
       )}
 
-      {pendingDiff && (
+      {approval && approval.diff && pendingApproval && (
         <PolicyDiffModal
-          diff={pendingDiff}
-          onConfirm={() => void runInstall(false)}
-          onCancel={() => setPendingDiff(null)}
+          diff={approval.diff}
+          onConfirm={() => void runInstall(false, pendingApproval)}
+          onCancel={() => setPendingApproval(null)}
         />
       )}
     </div>

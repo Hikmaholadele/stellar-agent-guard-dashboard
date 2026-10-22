@@ -72,6 +72,26 @@ test("a non-numeric cap is refused with the field named", () => {
   assert.ok(built.issues.some((issue) => issue.field === "perTxCap"));
 });
 
+test("caps and time bounds stay inside their XDR integer ranges", () => {
+  const cap = buildPolicyConfig(draft({ perTxCap: "170141183460469231731687303715884105728" }));
+  assert.equal(cap.ok, false);
+  if (cap.ok) return;
+  assert.ok(
+    cap.issues.some(
+      (issue) => issue.field === "perTxCap" && /maximum supported/.test(issue.message),
+    ),
+  );
+
+  const time = buildPolicyConfig(draft({ activeUntil: "18446744073709551616" }));
+  assert.equal(time.ok, false);
+  if (time.ok) return;
+  assert.ok(
+    time.issues.some(
+      (issue) => issue.field === "activeUntil" && /maximum supported/.test(issue.message),
+    ),
+  );
+});
+
 test("a malformed address is refused rather than passed through", () => {
   const built = buildPolicyConfig(draft({ recipients: "not-an-address" }));
   assert.equal(built.ok, false);

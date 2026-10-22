@@ -67,3 +67,15 @@ export function parseAddressList(csv: string): ParsedAddress[] {
 export function exportRFC4180(addresses: string[]): string {
   return addresses.map((a) => `"${a}"`).join("\r\n");
 }
+
+/** Neutralize formula-leading cells for CSV safety. */
+export function neutralizeFormulaCell(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length > 0) {
+    const first = trimmed[0];
+    if (first === "=" || first === "+" || first === "-" || first === "@") {
+      return "'" + value;
+    }
+  }
+  return value;
+}

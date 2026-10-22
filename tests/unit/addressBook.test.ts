@@ -18,6 +18,7 @@ import {
   saveContact,
   suggestedAlias,
   upsertContact,
+  validateContactAddress,
   type Contact,
   type StorageLike,
 } from "../../lib/guard/addressBook.ts";
@@ -448,6 +449,41 @@ test("an import writes only address-book data, never other browser or wallet sta
   assert.equal(dump["stellar-agent-guard-dashboard.wallet"], "keep-me");
   assert.equal(dump["some.other.key"], "untouched");
   assert.equal(lookupLabel(ACCOUNT, storage), "Treasury");
+});
+
+test("validateContactAddress rejects blank and malformed addresses with actionable feedback", () => {
+  // Valid addresses
+  assert.equal(
+    validateContactAddress(ACCOUNT).ok,
+    true,
+    "a valid account address should be accepted",
+  );
+  assert.equal(
+    validateContactAddress(CONTRACT).ok,
+    true,
+    "a valid contract address should be accepted",
+  );
+
+  // Blank address
+  const blankResult = validateContactAddress("");
+  assert.equal(blankResult.ok, false, "blank address should be rejected");
+  assert.match(
+    blankResult.reason,
+    /A contact needs an address/,
+    "reason should explain what is needed",
+  );
+
+  // Too short
+  const shortResult = validateContactAddress("GAAAAAA");
+  assert.equal(shortResult.ok, false, "too short should be rejected");
+  assert.match(shortResult.reason, /56 characters/, "reason should mention correct length");
+
+  // Too long
+  const longResult = validateContactAddress(
+    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  ); // 60 chars
+  assert.equal(longResult.ok, false, "too long should be rejected");
+  assert.match(longResult.reason, /56 characters/, "reason should mention correct length");
 });
 
 test("mergeAddressBook remains additive and reports its tally", () => {

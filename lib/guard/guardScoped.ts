@@ -131,3 +131,91 @@ export function clearGuardScopedState(
 
 /** The network this build scopes state under, re-exported for callers. */
 export const SCOPED_NETWORK = NETWORK.name;
+
+// ── Binding in-flight work to the guard that produced it ───────────────────
+//
+// Persistence keys keep *saved* state apart per guard. The same discipline is
+// needed for state that only lives in memory: a policy draft, the diff the
+// operator just approved, the outcome of a write. The active guard is shared
+// application context, so the operator (or another tab, or a link) can change it
+// while any of those is still on screen or still in flight. Anything that was
+// produced for one guard must therefore carry that guard and network with it,
+// and be honoured only while they are still the active ones.
+
+/** The guard and network a piece of work belongs to. */
+export interface GuardScope {
+  guard: string;
+  network: string;
+}
+
+export function guardScope(guard: string, network: string = NETWORK.name): GuardScope {
+  return { guard, network };
+}
+
+/** True only when both scopes name the same guard on the same network. */
+export function sameGuardScope(
+  a: GuardScope | null | undefined,
+  b: GuardScope | null | undefined,
+): boolean {
+  if (!a || !b) return false;
+  return a.guard === b.guard && a.network === b.network;
+}
+
+/** A value together with the scope that produced it. */
+export interface ScopeBound<T> {
+  scope: GuardScope;
+  value: T;
+}
+
+export function bindToScope<T>(scope: GuardScope, value: T): ScopeBound<T> {
+  return { scope: { ...scope }, value };
+}
+
+/**
+ * The bound value, or `null` when nothing is held or it was produced for a
+ * different guard or network than the active one. A stale value is not an error
+ * to show; it is simply not available.
+ */
+export function valueInScope<T>(
+  held: ScopeBound<T> | null | undefined,
+  active: GuardScope,
+): T | null {
+  if (!held) return null;
+  return sameGuardScope(held.scope, active) ? held.value : null;
+}
+
+export type ScopedWriteResult<R> =
+  /** The active guard changed before the write began: nothing was built or signed. */
+  | { kind: "stale"; approved: GuardScope; active: GuardScope }
+  /** The write ran for the guard that was approved. `stillActive` is checked after it settled. */
+  | { kind: "done"; result: R; approved: GuardScope; stillActive: boolean };
+
+/**
+ * Run a write for the guard that was *approved*, and only while that guard is
+ * still the active one.
+ *
+ * The scope is re-checked immediately before `write` is called, so an approval
+ * (a confirmed diff, a drafted policy) cannot be spent on whichever guard
+ * happens to be selected by the time the confirmation lands. `write` receives the
+ * approved guard address explicitly, so the transaction it builds can never be
+ * for any other guard. After the write settles, `stillActive` says whether its
+ * outcome still belongs on screen.
+ */
+export async function runScopedWrite<R>(params: {
+  approval: GuardScope;
+  activeScope: () => GuardScope;
+  write: (guard: string) => Promise<R>;
+}): Promise<ScopedWriteResult<R>> {
+  const { approval, activeScope, write } = params;
+  const before = activeScope();
+  if (!sameGuardScope(approval, before)) {
+    return { kind: "stale", approved: approval, active: before };
+  }
+  const result = await write(approval.guard);
+  return {
+    kind: "done",
+    result,
+    approved: approval,
+    stillActive: sameGuardScope(approval, activeScope()),
+  };
+}

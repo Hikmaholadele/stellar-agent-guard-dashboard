@@ -26,6 +26,7 @@
 import { StrKey, type rpc } from "@stellar/stellar-sdk";
 import { readStatus } from "./chain.ts";
 import { validateLabel } from "./inputSanitizer.ts";
+import type { RegistryChangeNotice } from "./tabSync.ts";
 import {
   defaultGuardLabel,
   looksLikeContractAddress,
@@ -135,4 +136,48 @@ export async function addGuard(params: AddGuardParams): Promise<AddGuardResult> 
     };
   }
   return { ok: true, instance };
+}
+
+// ── Following another tab's registry change ────────────────────────────────
+
+/**
+ * The instance list to hold after another tab changed the saved registry.
+ *
+ * `saved` is the registry as just re-read from storage — the authority. `current`
+ * is what this tab was showing. The only thing kept from `current` is the active
+ * guard when it is not in `saved` and was not the one just removed: a guard
+ * adopted from a link lives only in this tab's list, and dropping it would leave
+ * the selector without an option for the guard on screen.
+ */
+export function registryAfterChange(params: {
+  saved: readonly GuardInstance[];
+  current: readonly GuardInstance[];
+  activeGuard: string;
+  notice: Pick<RegistryChangeNotice, "kind" | "guard">;
+}): GuardInstance[] {
+  const { saved, current, activeGuard, notice } = params;
+  const removedActive = notice.kind === "remove" && notice.guard === activeGuard;
+  const active = current.find((instance) => instance.guard === activeGuard);
+  if (active && !removedActive && !saved.some((instance) => instance.guard === activeGuard)) {
+    return [...saved, active];
+  }
+  return [...saved];
+}
+
+/**
+ * The guard to move to when another tab deleted the one this tab is showing, or
+ * `null` when no move is needed (a different guard changed, the guard is still
+ * saved — a build-seeded guard cannot be deleted — or the change was not a
+ * removal). The choice matches a local delete: the first remaining guard.
+ */
+export function fallbackAfterRemoval(params: {
+  saved: readonly GuardInstance[];
+  activeGuard: string;
+  notice: Pick<RegistryChangeNotice, "kind" | "guard">;
+  defaultGuard: string;
+}): string | null {
+  const { saved, activeGuard, notice, defaultGuard } = params;
+  if (notice.kind !== "remove" || notice.guard !== activeGuard) return null;
+  if (saved.some((instance) => instance.guard === activeGuard)) return null;
+  return saved[0]?.guard ?? defaultGuard;
 }

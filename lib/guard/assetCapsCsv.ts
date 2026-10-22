@@ -14,6 +14,7 @@ export interface AssetCapImport {
 }
 
 const HEADERS = ["asset_contract_address", "max_cap_stroops", "symbol"] as const;
+const MAX_STROOP_CAP = (1n << 127n) - 1n;
 
 export function parseAssetCapsCsv(source: string): AssetCapOverride[] {
   const records = parseCsvRecords(source);
@@ -104,12 +105,12 @@ export function validateAssetCapOverrides(rows: AssetCapOverride[]): string[] {
         `Asset override ${index + 1}: asset_contract_address is not a valid Stellar contract address`,
       );
     }
-    if (
-      !row.maxCapStroops ||
-      !/^\d+$/.test(row.maxCapStroops) ||
-      BigInt(row.maxCapStroops || "0") <= 0n
-    ) {
+    if (!row.maxCapStroops || !/^\d+$/.test(row.maxCapStroops)) {
       errors.push(`Asset override ${index + 1}: max_cap_stroops must be a positive integer`);
+    } else if (BigInt(row.maxCapStroops) <= 0n) {
+      errors.push(`Asset override ${index + 1}: max_cap_stroops must be a positive integer`);
+    } else if (BigInt(row.maxCapStroops) > MAX_STROOP_CAP) {
+      errors.push(`Asset override ${index + 1}: max_cap_stroops exceeds the supported i128 range`);
     }
     if (!row.symbol.trim()) errors.push(`Asset override ${index + 1}: symbol is required`);
     if (seen.has(row.assetContractAddress))
@@ -132,6 +133,11 @@ function validateRows(records: string[][], source: string): AssetCapOverride[] {
     }
     if (!maxCapStroops || !/^\d+$/.test(maxCapStroops) || BigInt(maxCapStroops) <= 0n) {
       throw new Error(`${source} row ${index + 2}: max_cap_stroops must be a positive integer`);
+    }
+    if (BigInt(maxCapStroops) > MAX_STROOP_CAP) {
+      throw new Error(
+        `${source} row ${index + 2}: max_cap_stroops exceeds the supported i128 range`,
+      );
     }
     if (!symbol) throw new Error(`${source} row ${index + 2}: symbol is required`);
     if (seen.has(assetContractAddress))

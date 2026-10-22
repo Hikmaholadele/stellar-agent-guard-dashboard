@@ -295,7 +295,8 @@ The **About** description and the topic list are repository settings, not files 
 
 - GitHub issues: <https://github.com/aigbagbobila/stellar-agent-guard-dashboard/issues>
 - Maintainer (GitHub): [@aigbagbobila](https://github.com/aigbagbobila)
-- Security disclosures: see [SECURITY.md](https://github.com/aigbagbobila/stellar-agent-guard-contracts/blob/main/SECURITY.md) (Telegram, the Stellar ecosystem norm)
+- Dashboard security disclosures: see this repository's [SECURITY.md](SECURITY.md).
+- Contract and protocol security disclosures: see the [contracts SECURITY.md](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-contracts/blob/main/SECURITY.md).
 
 ## License
 
