@@ -32,6 +32,7 @@
  */
 
 import { Address } from "@stellar/stellar-sdk";
+import { validateLabel } from "./inputSanitizer.ts";
 import {
   decodeVersionedRecord,
   encodeVersionedRecord,
