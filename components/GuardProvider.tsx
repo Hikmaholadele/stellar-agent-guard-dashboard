@@ -52,6 +52,13 @@ import {
   type FeedSource,
 } from "../lib/guard/feedSubscriptions.ts";
 import {
+  loadTailSelection,
+  planTailSources,
+  prunePinned,
+  saveTailSelection,
+} from "../lib/guard/feedSelection.ts";
+import { POLL_OFF, pollHealth, type PollHealth } from "../lib/guard/feedHealth.ts";
+import {
   createRegistryAnnouncer,
   createRegistryChangeFilter,
   createTabSync,
@@ -135,6 +142,35 @@ const RANGE_PRESET_LABELS: Record<Exclude<RangePreset, "custom">, string> = {
   "7d": "last 7 days",
 };
 
+/**
+ * The raw liveness inputs for one tab's tail (#311).
+ *
+ * Kept as its own state object, separate from the event buffer, because the two
+ * answer different questions: this one answers "is the poller alive", and the
+ * buffer answers "what did the guard do". A round that returned zero events moves
+ * `lastSuccessAt` forward and leaves `eventsInLastRound` at 0 — that combination
+ * is the state this issue is about, and it only survives if the two are stored
+ * apart.
+ */
+interface PollRaw {
+  /** A round is in flight right now. */
+  polling: boolean;
+  lastSuccessAt: string | null;
+  lastAttemptAt: string | null;
+  lastFailureAt: string | null;
+  error: string | null;
+  eventsInLastRound: number;
+}
+
+const INITIAL_POLL: PollRaw = {
+  polling: false,
+  lastSuccessAt: null,
+  lastAttemptAt: null,
+  lastFailureAt: null,
+  error: null,
+  eventsInLastRound: 0,
+};
+
 export interface GuardContextValue {
   server: rpc.Server;
   wallet: ConnectedWallet | null;
@@ -190,6 +226,7 @@ export interface GuardContextValue {
     watching: boolean;
     latestLedger: number | null;
     error: string | null;
+    /** ISO time of the last poll *attempt*. Not a success claim — see `health`. */
     lastPolledAt: string | null;
     /** The guards currently tailed (up to `FEED_GUARD_CAP`), with their labels. */
     guards: FeedSource[];
@@ -198,6 +235,12 @@ export interface GuardContextValue {
     /** Labels of the excluded guards, so the cap can be named, not just counted. */
     cappedLabels: string[];
     /**
+     * Poll liveness, kept apart from whether events arrived (#311). Derived from
+     * the last successful round, the in-flight flag and the last failure — never
+     * from the row count, so a quiet guard reads as healthy rather than broken.
+     */
+    health: PollHealth;
+    /**
      * Guards whose feed has a known hole or an unsettled position. Empty does
      * not mean complete — only that no discontinuity has been detected.
      */
@@ -205,6 +248,14 @@ export interface GuardContextValue {
   };
   startWatching: () => void;
   stopWatching: () => void;
+  /**
+   * The guards the operator chose to spend feed capacity on (#310), in their own
+   * order. The guard on screen is always tailed regardless, and the remaining
+   * slots fill from the registry.
+   */
+  tailSelection: string[];
+  /** Add or remove one guard from the tailed set, then re-tail immediately. */
+  toggleTailedGuard: (guard: string) => void;
   /**
    * Stream display controls. Pausing freezes the table while polling carries on
    * in the background; new events queue until resume.
@@ -230,6 +281,13 @@ export interface GuardContextValue {
   queryRange: (range: TimeRange, preset: RangePreset) => Promise<void>;
   /** Human-readable label of the range currently displayed, or null when live. */
   rangeLabel: string | null;
+  /**
+   * The bounds of the range currently displayed, or null when the feed is on the
+   * live tail. #309: an export preview must name the range it applied, and a label
+   * like "Last 24 Hours" is not a bound — this is the same `TimeRange` that was
+   * queried, so the preview and the rows on screen cannot disagree.
+   */
+  exportRange: TimeRange | null;
   /**
    * Tell the other open tabs that this one changed something. The provider adds
    * the active guard, so callers only name the change.
@@ -331,7 +389,14 @@ export function GuardProvider({
   const [retryingField, setRetryingField] = useState<SnapshotField | null>(null);
   const [buffer, setBuffer] = useState<StreamBuffer>(emptyStreamBuffer);
   const [rangeLabel, setRangeLabel] = useState<string | null>(null);
-  const [feed, setFeed] = useState<GuardContextValue["feed"]>({
+  const [exportRange, setExportRange] = useState<TimeRange | null>(null);
+  // #310: the operator's chosen tail set, read once from this network's bucket.
+  const [tailSelection, setTailSelection] = useState<string[]>(() => loadTailSelection());
+  // Poll liveness (#311), held apart from the event buffer so the two can never
+  // be confused by a later edit. `lastSuccessAt` is written ONLY by a round that
+  // returned; the attempt stamp lives on `feed.lastPolledAt`.
+  const [poll, setPoll] = useState<PollRaw>(INITIAL_POLL);
+  const [feed, setFeed] = useState<Omit<GuardContextValue["feed"], "health">>({
     watching: false,
     latestLedger: null,
     error: null,
@@ -355,10 +420,12 @@ export function GuardProvider({
   const clearEvents = useCallback(() => {
     setBuffer(clearStreamRows);
     setRangeLabel(null);
+    setExportRange(null);
   }, []);
   const resetEvents = useCallback(() => {
     setBuffer(emptyStreamBuffer());
     setRangeLabel(null);
+    setExportRange(null);
   }, []);
 
   // The active feed is reached only through an identity-keyed coordinator, so a
@@ -395,20 +462,29 @@ export function GuardProvider({
   }, []);
 
   /**
-   * The guards to tail, active guard first.
+   * The guards to tail, in the order that decides who gets the capped slots.
    *
    * The active guard leads so the cap can never exclude the account on screen —
-   * a full registry must not starve the one the operator is looking at.
+   * a full registry must not starve the one the operator is looking at. After it
+   * come the guards the operator *chose* (#310), then the rest of the registry.
+   * `MultiGuardFeed.sync()` keeps the first `cap` sources it is handed, so this
+   * ordering is what makes selection authoritative rather than incidental: with
+   * plain registry order the five oldest saved guards were tailed by accident,
+   * and a guard added last — often the one being investigated — sat outside the
+   * feed with nothing on screen to say so.
    */
   const feedSources = useMemo<FeedSource[]>(() => {
-    const sources: FeedSource[] = [
-      { guard, label: instances.find((i) => i.guard === guard)?.label ?? "Active account" },
-    ];
-    for (const instance of instances) {
-      if (instance.guard !== guard) sources.push({ guard: instance.guard, label: instance.label });
-    }
-    return sources;
-  }, [guard, instances]);
+    const registry: FeedSource[] = instances.map((instance) => ({
+      guard: instance.guard,
+      label: instance.label,
+    }));
+    return planTailSources({
+      registry,
+      active: guard,
+      pinned: tailSelection,
+      cap: FEED_GUARD_CAP,
+    }).ordered;
+  }, [guard, instances, tailSelection]);
   // The active guard, readable from the (long-lived) sync listener without
   // re-subscribing on every guard change.
   const guardRef = useRef(guard);
@@ -1047,6 +1123,7 @@ export function GuardProvider({
       const supervisor = multiFeedRef.current;
       supervisor?.sync(feedSources);
       const capped = supervisor?.dropped() ?? [];
+      setPoll(INITIAL_POLL);
       setFeed((current) => ({
         ...current,
         watching: true,
@@ -1066,6 +1143,7 @@ export function GuardProvider({
     // cannot keep running behind a "not watching" header.
     multiFeedRef.current?.stopAll();
     multiFeedRef.current = null;
+    setPoll(INITIAL_POLL);
     setFeed((current) => ({
       ...current,
       watching: false,
@@ -1075,6 +1153,51 @@ export function GuardProvider({
       gaps: [],
     }));
   }, []);
+
+  /**
+   * Choose, or un-choose, one guard for a tailed slot (#310).
+   *
+   * The change is persisted to this network's bucket and reconciled at once, so
+   * picking a guard starts its listener without waiting for the next poll and
+   * dropping one stops it — the supervisor's `sync()` is the only place listeners
+   * are created or stopped, so a toggle cannot leak a listener in either
+   * direction. A storage rejection (private mode, quota) is not announced as a
+   * failure: the choice holds for this session, which is the truth.
+   */
+  const toggleTailedGuard = useCallback(
+    (target: string) => {
+      const next = tailSelection.includes(target)
+        ? tailSelection.filter((entry) => entry !== target)
+        : [...tailSelection, target];
+      const pinned = prunePinned(
+        next,
+        instances.map((instance) => ({
+          guard: instance.guard,
+          label: instance.label,
+        })),
+      );
+      setTailSelection(pinned);
+      saveTailSelection(pinned);
+      const supervisor = multiFeedRef.current;
+      if (supervisor && feed.watching) {
+        const registry: FeedSource[] = instances.map((instance) => ({
+          guard: instance.guard,
+          label: instance.label,
+        }));
+        supervisor.sync(
+          planTailSources({ registry, active: guard, pinned, cap: FEED_GUARD_CAP }).ordered,
+        );
+        const capped = supervisor.dropped();
+        setFeed((current) => ({
+          ...current,
+          guards: supervisor.guards(),
+          capped: capped.length,
+          cappedLabels: capped.map((source) => source.label),
+        }));
+      }
+    },
+    [tailSelection, instances, feed.watching, guard],
+  );
 
   // Keep the running listeners aligned with the registry while watching (#23).
   // This is what starts a listener for a newly added guard and stops one whose
@@ -1115,6 +1238,10 @@ export function GuardProvider({
               range.toUnixSecs === null ? "now" : new Date(range.toUnixSecs * 1000).toLocaleString()
             }`
           : RANGE_PRESET_LABELS[preset];
+      // #309: remember the *bounds*, not just the caption. An export preview has
+      // to state the range it applied, and "last 24 hours" is a label whose
+      // endpoint moves with the clock — the resolved range is the checkable value.
+      setExportRange(range);
       if (demo) {
         const from = range.fromUnixSecs ?? 0;
         const to = range.toUnixSecs ?? Number.MAX_SAFE_INTEGER;
@@ -1177,6 +1304,38 @@ export function GuardProvider({
     setIdleTimeoutMs(valueMs);
   }, []);
 
+  /**
+   * Re-evaluate liveness on a clock, not only on poll results (#311).
+   *
+   * This is the part the issue would silently defeat if it were skipped: an
+   * `overdue` feed is defined by a poll that *did not happen*, so a health reading
+   * that only recomputed on a poll could never reach that state — the very
+   * condition it exists to report would be the one that stops it from being
+   * evaluated. A stopped clock advances anyway.
+   */
+  const [healthNowMs, setHealthNowMs] = useState<number>(() => Date.now());
+  useEffect(() => {
+    if (!feed.watching) return;
+    const timer = setInterval(() => setHealthNowMs(Date.now()), FEED_INTERVAL_MS);
+    const unregister = memoryWiper.add(() => clearInterval(timer));
+    return () => {
+      clearInterval(timer);
+      unregister();
+    };
+  }, [feed.watching]);
+
+  const health = useMemo<PollHealth>(() => {
+    if (!feed.watching && poll.lastSuccessAt === null && poll.lastFailureAt === null) {
+      return POLL_OFF;
+    }
+    return pollHealth({
+      ...poll,
+      watching: feed.watching,
+      nowMs: healthNowMs,
+      intervalMs: FEED_INTERVAL_MS,
+    });
+  }, [feed.watching, poll, healthNowMs]);
+
   useEffect(() => {
     if (!feed.watching) return;
 
@@ -1198,6 +1357,9 @@ export function GuardProvider({
           lastPolledAt: new Date().toISOString(),
           error: null,
         }));
+        // `poll` is deliberately left alone: demo mode makes no RPC round, so the
+        // health reading stays `pending` rather than claiming a poll succeeded.
+        // Fixture rows are already labelled as fixtures elsewhere on the panel.
       };
       const demoTimer = setInterval(emit, POLLING.demoEventMs);
       const unregister = memoryWiper.add(() => clearInterval(demoTimer));
@@ -1217,6 +1379,8 @@ export function GuardProvider({
       // blank page (see FEED_SWITCH_HISTORY_LEDGERS).
       const supervisor = multiFeedRef.current;
       if (!supervisor) return;
+      const attemptedAt = new Date().toISOString();
+      setPoll((current) => ({ ...current, polling: true, lastAttemptAt: attemptedAt }));
       try {
         const page = await supervisor.pollAll();
         if (cancelled) return;
@@ -1228,20 +1392,47 @@ export function GuardProvider({
         // blank the guards that answered. `error` carries the first failure so
         // the panel still has a headline to show.
         const failed = page.watch.find((entry) => !entry.ok);
+        const anyAnswered = page.watch.some((entry) => entry.ok);
+        const completedAt = new Date().toISOString();
         setFeed((current) => ({
           ...current,
           latestLedger: page.latestLedger ?? current.latestLedger,
-          lastPolledAt: new Date().toISOString(),
+          // An *attempt* stamp. #311: it is not a success claim, which is why the
+          // success stamp below is a separate field with its own writer.
+          lastPolledAt: completedAt,
           guards: supervisor.guards(),
           gaps: feedGapNotices(page.watch),
           error: failed ? `${failed.label}: ${failed.error}` : null,
         }));
+        setPoll((current) => ({
+          polling: false,
+          lastAttemptAt: completedAt,
+          // A round that returned is a live poll even when it carried nothing:
+          // an empty page from a quiet guard must advance the success stamp and
+          // leave the event count at zero, which is the pairing the panel reads
+          // as "alive, nothing happened" rather than "broken".
+          lastSuccessAt: completedAt,
+          // Only a round where *no* guard answered counts as a poll failure. A
+          // partial failure keeps the feed healthy and shows its own error line,
+          // because "three of five guards answered" is not a dead endpoint.
+          lastFailureAt: anyAnswered ? current.lastFailureAt : completedAt,
+          error: failed ? `${failed.label}: ${failed.error}` : null,
+          eventsInLastRound: page.events.length,
+        }));
       } catch (error) {
         if (cancelled) return;
-        setFeed((current) => ({
+        const failedAt = new Date().toISOString();
+        const message = error instanceof Error ? error.message : String(error);
+        setFeed((current) => ({ ...current, error: message, lastPolledAt: failedAt }));
+        // The success stamp is left exactly where it was: a failed round cannot
+        // make the feed look recently-healthy, and a later success has to be able
+        // to overtake this failure — which is the recovery the issue asks to show.
+        setPoll((current) => ({
           ...current,
-          error: error instanceof Error ? error.message : String(error),
-          lastPolledAt: new Date().toISOString(),
+          polling: false,
+          lastAttemptAt: failedAt,
+          lastFailureAt: failedAt,
+          error: message,
         }));
       }
     };
@@ -1297,16 +1488,19 @@ export function GuardProvider({
       refresh,
       retryRead,
       retryingField,
-      feed,
+      feed: { ...feed, health },
       stream,
       pauseStream,
       resumeStream,
       startWatching,
       stopWatching,
+      tailSelection,
+      toggleTailedGuard,
       clearEvents,
       pushEvents,
       queryRange,
       rangeLabel,
+      exportRange,
       notifyTabs,
       session: {
         state: idleState,
@@ -1341,15 +1535,19 @@ export function GuardProvider({
       retryRead,
       retryingField,
       feed,
+      health,
       stream,
       pauseStream,
       resumeStream,
       startWatching,
       stopWatching,
+      tailSelection,
+      toggleTailedGuard,
       clearEvents,
       pushEvents,
       queryRange,
       rangeLabel,
+      exportRange,
       notifyTabs,
       idleState,
       idleTimeoutMs,

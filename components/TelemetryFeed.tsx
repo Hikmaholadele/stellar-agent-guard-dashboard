@@ -25,6 +25,8 @@ import { NETWORK } from "../lib/guard/network.ts";
 import { loadScopedValue, saveScopedValue } from "../lib/guard/guardScoped.ts";
 import { useAnnounce } from "../lib/guard/useAnnounce.ts";
 import { eventsToCsv, eventsToJson, exportFilename } from "../lib/guard/eventExport.ts";
+import { buildExportScope, describeExportScope } from "../lib/guard/exportScope.ts";
+import type { PollPhase } from "../lib/guard/feedHealth.ts";
 import { streamPaused, streamResumed } from "../lib/guard/announceCopy.ts";
 import { BlockedEventBadge } from "./BlockedEventBadge.tsx";
 import { useDemoMode } from "../lib/guard/useDemoMode.ts";
@@ -48,6 +50,19 @@ import {
 
 /** The scoped-state base under which each guard's feed filter is remembered. */
 const SCOPED_FILTER_BASE = "feedFilter";
+
+/**
+ * The header pill wording for each poll phase (#311). Short, and never the same
+ * word twice: "polling" covered both a live feed and a stuck one before, which is
+ * the conflation this issue is about.
+ */
+const HEALTH_LABELS: Record<PollPhase, string> = {
+  off: "stopped",
+  pending: "connecting",
+  healthy: "polling",
+  failing: "poll failing",
+  overdue: "no response",
+};
 
 /** Human names for the topic filter's options, keyed by the topic symbol. */
 const TOPIC_LABELS: Record<string, string> = {
@@ -116,7 +131,10 @@ export function TelemetryFeed() {
     guard,
     queryRange,
     rangeLabel,
+    exportRange,
     instances,
+    tailSelection,
+    toggleTailedGuard,
   } = useGuard();
   // Restore a shared verdict filter from the URL, while retaining the other
   // filter dimensions independently for each guard in local storage.
@@ -168,24 +186,28 @@ export function TelemetryFeed() {
    * Download the feed through the shared export path (issue #37). The schema,
    * BOM and filename rules all live in `lib/guard/eventExport.ts` — this is a
    * thin binding, not a second exporter.
+   *
+   * #309: it hands over `scope.rows`, which is the exact array the preview above
+   * counted. There is no second selection step, so the count the operator read
+   * before clicking cannot differ from the count in the file they got.
    */
   function downloadExport(format: "csv" | "json") {
     const content =
       format === "csv"
-        ? eventsToCsv(rows, guard)
-        : JSON.stringify(eventsToJson(rows, guard), null, 2);
+        ? eventsToCsv(scope.rows, guard)
+        : JSON.stringify(eventsToJson(scope.rows, guard), null, 2);
     const type = format === "csv" ? "text/csv;charset=utf-8" : "application/json";
     const blob = new Blob([content], { type });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = exportFilename(guard, format, rows.length);
+    link.download = exportFilename(guard, format, scope.rowCount);
     document.body.appendChild(link);
     link.click();
     link.remove();
     URL.revokeObjectURL(url);
     announce(
-      `Exported ${rows.length} event${rows.length === 1 ? "" : "s"} as ${format.toUpperCase()}`,
+      `Exported ${scope.rowCount} event${scope.rowCount === 1 ? "" : "s"} as ${format.toUpperCase()}`,
     );
   }
 
@@ -203,6 +225,18 @@ export function TelemetryFeed() {
   // projection, so an export is the filtered multi-guard view and nothing more.
   const rows = filterGuardEvents(guardVisible, filter);
   const filterActive = isFilterActive(filter) || selectedGuards.size > 0;
+
+  /**
+   * The scope every download leaves with (#309), computed from the same rows the
+   * table is showing. Each exporter is handed `scope.rows`, so the range, the
+   * count and the "diagnostics included" line in the preview below are statements
+   * about the file rather than statements about the screen.
+   *
+   * Not a `useMemo`: `rows` is a fresh array on every render (it is a filter, not
+   * a cached value), so a memo here would recompute anyway and only claim a
+   * stabilisation it never provided.
+   */
+  const scope = buildExportScope({ events: rows, range: exportRange, rangeLabel });
 
   /**
    * Chips describe what is actually tailed: the live tail's (capped) set while
@@ -226,7 +260,7 @@ export function TelemetryFeed() {
   function exportAuditLog() {
     const exportedAt = new Date();
     const body = telemetryToAuditLog({
-      events: rows,
+      events: scope.rows,
       bufferedCount: events.length,
       guard,
       network: NETWORK.name,
@@ -240,7 +274,7 @@ export function TelemetryFeed() {
       body,
       `${NDJSON_MIME};charset=utf-8`,
     );
-    announce(`Exported ${rows.length} event${rows.length === 1 ? "" : "s"} to the audit log`);
+    announce(`Exported ${scope.rowCount} event${scope.rowCount === 1 ? "" : "s"} to the audit log`);
   }
 
   function applyRange(range: TimeRange, preset: RangePreset) {
@@ -287,7 +321,9 @@ export function TelemetryFeed() {
       <div className="row" style={{ justifyContent: "space-between" }}>
         <h2 style={{ margin: 0 }}>Telemetry</h2>
         <div className="row">
-          {feed.watching && <span className="pill ok">polling</span>}
+          {feed.watching && (
+            <span className={`pill ${feed.health.tone}`}>{HEALTH_LABELS[feed.health.phase]}</span>
+          )}
           {stream.paused && <span className="pill warn">paused</span>}
           {/* Counted from the buffer, not from the rows on screen: a paused,
               filtered or empty table can hide a blocked decision that is plainly
@@ -367,6 +403,29 @@ export function TelemetryFeed() {
         )}
       </div>
 
+      {/*
+        What the download is about to contain (#309), stated before the operator
+        clicks rather than after. Every number here is read off `scope`, and
+        `scope.rows` is the array the exporters are handed — so this is a claim
+        about the file, not a restatement of the table. The field list is imported
+        from the exporter itself, and the omission of `data` is named because that
+        is the one event field that could carry payload material.
+      */}
+      <div className="notice info" style={{ marginTop: 10 }}>
+        <strong>Export scope</strong>
+        <ul className="tiny" style={{ margin: "4px 0 0 0", paddingLeft: 18 }}>
+          {describeExportScope(scope).map((line) => (
+            <li key={line}>{line}</li>
+          ))}
+        </ul>
+        {scope.excludedByRange > 0 && (
+          <span className="tiny">
+            {scope.excludedByRange} row(s) you can see are outside the selected range and will not
+            be in the file.
+          </span>
+        )}
+      </div>
+
       <div className="row" style={{ marginTop: 10, flexWrap: "wrap", gap: 8 }}>
         <label
           className="tiny muted"
@@ -420,7 +479,7 @@ export function TelemetryFeed() {
         <button
           className="secondary"
           onClick={() => downloadExport("csv")}
-          disabled={rows.length === 0}
+          disabled={scope.rowCount === 0}
           title="Stable append-only schema (docs/export-schema.md): schema_version, guard, topic, kind, source, decision, reason, reason_label, ledger, ledger_closed_at, transaction_hash — BOM-prefixed for Excel"
         >
           Export CSV
@@ -428,7 +487,7 @@ export function TelemetryFeed() {
         <button
           className="secondary"
           onClick={() => downloadExport("json")}
-          disabled={rows.length === 0}
+          disabled={scope.rowCount === 0}
           title="Same schema as the CSV export, as one JSON object: schemaVersion, columns, guard, rows"
         >
           Export JSON
@@ -436,16 +495,20 @@ export function TelemetryFeed() {
         <button
           className="secondary"
           onClick={() =>
-            downloadText("guard-telemetry.ndjson", telemetryToNdjson(rows), "application/x-ndjson")
+            downloadText(
+              "guard-telemetry.ndjson",
+              telemetryToNdjson(scope.rows),
+              "application/x-ndjson",
+            )
           }
-          disabled={rows.length === 0}
+          disabled={scope.rowCount === 0}
         >
           Export NDJSON
         </button>
         <button
           className="secondary"
           onClick={exportAuditLog}
-          disabled={rows.length === 0}
+          disabled={scope.rowCount === 0}
           title="NDJSON audit log: a header line, then decoded fields, verdict, ledger, transaction hash and the raw event XDR per event (terms in docs/glossary.md — XDR, Ledger, Stroop)"
         >
           Export audit log
@@ -500,10 +563,29 @@ export function TelemetryFeed() {
         Tailed from Soroban RPC&apos;s <code>getEvents</code> with a cursor, so no event is
         delivered twice and none is skipped between polls. Soroban has no push stream — the floor on
         latency is the ledger close interval (roughly 5s), not the 5s poll.
-        {feed.lastPolledAt && (
+      </p>
+
+      {/*
+        Poll liveness, stated separately from the rows below it (#311). This is
+        deliberately *not* a live region: it re-renders on every poll, so as a
+        live region it would interrupt on each quiet round — announcing "still
+        alive" every five seconds. It is plain text with an explicit label, so a
+        screen reader gets it on demand, and the one transition that does deserve
+        an interruption (a poll beginning to fail) is the error block under it.
+
+        Two stamps are shown because they answer different questions: the last
+        round that *returned*, and the last one that was *attempted*. Before #311
+        the panel had one field covering both, so "last poll 5s ago" was true of a
+        feed whose every poll since the first had failed.
+      */}
+      <p className="tiny muted" style={{ marginTop: 4 }} aria-label="Telemetry poll health">
+        <span className={`pill ${feed.health.tone}`}>{HEALTH_LABELS[feed.health.phase]}</span>{" "}
+        {feed.health.text}
+        {feed.lastPolledAt && feed.lastPolledAt !== feed.health.lastSuccessAt && (
           <>
             {" "}
-            Last poll <TimeAgo iso={feed.lastPolledAt} suffix=" ago" />.
+            (Last attempt <TimeAgo iso={feed.lastPolledAt} suffix=" ago" />
+            .)
           </>
         )}
       </p>
@@ -523,9 +605,9 @@ export function TelemetryFeed() {
             {feed.capped === 1 ? "is" : "are"} not being tailed
           </strong>
           <span className="tiny">
-            {feed.cappedLabels.join(", ")}. Their events will not appear in this feed. Remove a
-            guard from the registry, or stop watching, to tail a different set — the cap keeps poll
-            load bounded rather than silently multiplying RPC traffic.
+            {feed.cappedLabels.join(", ")}. Their events will not appear in this feed. Choose which
+            of them to tail below — the cap keeps poll load bounded rather than silently multiplying
+            RPC traffic, but which guards it bounds is your decision, not the registry&apos;s order.
           </span>
         </div>
       )}
@@ -557,6 +639,51 @@ export function TelemetryFeed() {
           )}
         </div>
       ))}
+
+      {/*
+        Which guards spend the capped slots (#310). Every saved guard is listed,
+        not just the tailed ones, because the whole point is that the unselected
+        set is invisible-but-real: an operator cannot choose to tail a guard they
+        cannot see. The active guard is shown as pinned rather than as a checkbox,
+        since #23's rule that the guard on screen is never starved outranks a
+        selection.
+      */}
+      <fieldset style={{ marginTop: 10 }}>
+        <legend className="tiny muted">
+          Guards to tail ({feed.guards.length} of {FEED_GUARD_CAP} slots used)
+        </legend>
+        <div className="row" style={{ flexWrap: "wrap", gap: 8 }}>
+          {instances.map((instance) => {
+            const chosen = tailSelection.includes(instance.guard);
+            const isTailed = feed.guards.some((source) => source.guard === instance.guard);
+            const isActive = instance.guard === guard;
+            return (
+              <label
+                key={instance.guard}
+                className={`pill${isTailed ? " ok" : " muted"}`}
+                style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+                title={`${instance.guard}${isActive ? " — the guard on screen, always tailed" : ""}`}
+              >
+                <input
+                  type="checkbox"
+                  aria-label={`Tail ${instance.label}`}
+                  checked={isActive || chosen}
+                  disabled={isActive}
+                  onChange={() => toggleTailedGuard(instance.guard)}
+                />
+                {instance.label}
+                {isActive && <span className="tiny">on screen</span>}
+              </label>
+            );
+          })}
+        </div>
+        <p className="tiny muted" style={{ marginTop: 6 }}>
+          Each tailed guard is its own <code>getEvents</code> poll loop, so {feed.guards.length}{" "}
+          listener{feed.guards.length === 1 ? "" : "s"} are live now. Your choice is remembered for{" "}
+          {NETWORK.name} only, and only names which guards get the slots — it never changes what the
+          chain says about them.
+        </p>
+      </fieldset>
 
       <div className="notice info">
         <strong>Refused decisions cannot reach this feed from the ledger</strong>

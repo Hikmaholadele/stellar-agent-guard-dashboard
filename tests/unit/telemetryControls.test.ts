@@ -208,17 +208,25 @@ describe("clear buffer", () => {
 });
 
 describe("with the real poller", () => {
-  /** A stub RPC whose getEvents serves one page per call, honouring the cursor. */
-  function stubServer(pages: Array<Array<{ ledger: number; at: bigint }>>) {
+  /**
+   * A stub RPC whose getEvents serves one page per call, honouring the cursor.
+   * `failOn` is a list of 1-based **attempt** numbers that throw instead of
+   * answering — and a thrown attempt consumes no page, which is exactly what an
+   * RPC that never replied did.
+   */
+  function stubServer(pages: Array<Array<{ ledger: number; at: bigint }>>, failOn: number[] = []) {
     const requests: Array<{ cursor?: string; startLedger?: number }> = [];
     let call = 0;
+    let attempt = 0;
     const server = {
       getLatestLedger: async () => ({ sequence: 100 }),
       getEvents: async (request: { cursor?: string; startLedger?: number }) => {
+        attempt += 1;
         requests.push({
           ...(request.cursor === undefined ? {} : { cursor: request.cursor }),
           ...(request.startLedger === undefined ? {} : { startLedger: request.startLedger }),
         });
+        if (failOn.includes(attempt)) throw new Error("rpc unavailable");
         const page = pages[call] ?? [];
         call += 1;
         const events = page.map(
@@ -278,5 +286,38 @@ describe("with the real poller", () => {
       ["start:100", "cursor-1", "cursor-2", "cursor-3"],
       "every poll continued from the previous cursor: nothing re-scanned, nothing skipped",
     );
+  });
+
+  test("a poll that fails leaves the cursor exactly where it was and the retry resumes from it (issue #311)", async () => {
+    // The health indicators added for #311 are written from the same tick that
+    // polls, so the claim under test is that recording a failure cannot move the
+    // feed: not forward (which would skip the page the failure lost) and not back
+    // to no cursor (which would re-scan the head and re-deliver everything).
+    const { server, requests } = stubServer(
+      [[{ ledger: 101, at: 1n }], [{ ledger: 102, at: 2n }]],
+      [2],
+    );
+    const feed = new GuardFeed(server, GUARD);
+
+    const first = await feed.pollOnce();
+    assert.equal(first.events.length, 1);
+    const beforeFailure = feed.position();
+    assert.deepEqual(beforeFailure, { cursor: "cursor-1", latestLedger: 101 });
+
+    await assert.rejects(() => feed.pollOnce(), /rpc unavailable/);
+    assert.deepEqual(
+      feed.position(),
+      beforeFailure,
+      "a failed round advances nothing and resets nothing",
+    );
+
+    const third = await feed.pollOnce();
+    assert.deepEqual(
+      requests.map((request) => request.cursor ?? `start:${request.startLedger}`),
+      ["start:100", "cursor-1", "cursor-1"],
+      "the retry asks for the same cursor the failed round had, so no ledger is skipped",
+    );
+    assert.deepEqual(ledgers(third.events), [102], "and the lost page is delivered on the retry");
+    assert.deepEqual(feed.position(), { cursor: "cursor-2", latestLedger: 102 });
   });
 });

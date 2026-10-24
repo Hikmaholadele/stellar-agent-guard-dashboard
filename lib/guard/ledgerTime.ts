@@ -24,6 +24,15 @@
 export const AVERAGE_LEDGER_CLOSE_SECS = 5;
 
 /**
+ * How old a chain-time reading may be and still be called *fresh* (issue
+ * #388). Two to three missed ledger closes at the protocol target: within it,
+ * elapsed real time is elapsed chain time for countdown purposes; beyond it,
+ * the chain may have moved on in ways this console has not read, so a
+ * countdown may keep ticking but must stop claiming to be chain-verified.
+ */
+export const LEDGER_CLOCK_MAX_AGE_SECS = 90;
+
+/**
  * An observation that anchors the ledger clock: a ledger sequence known to
  * have closed at a given time. `getLatestLedger` and every `getEvents` page
  * both produce one.
@@ -178,4 +187,78 @@ export function ledgerWindowForRange(
       ? null
       : estimateLedgerAtTime(anchor, range.toUnixSecs, averageCloseSecs);
   return { startLedger, endLedger };
+}
+
+/**
+ * The reference clock a countdown is judged against (issue #388).
+ *
+ * The chain is the authority: `status().now` is the ledger clock, and every
+ * policy deadline (dead-man threshold, active window) is judged against *it*
+ * on chain. The browser clock only ever enters as a bounded measure of how old
+ * a chain reading is — never as the value the countdown is computed from —
+ * because a skewed device clock must not be able to make a window look closer
+ * to expiry than the chain considers it to be.
+ */
+export type ReferenceTimeSource = "ledger" | "browser";
+
+export interface ReferenceTime {
+  /** Unix seconds to judge countdowns against. */
+  unixSecs: number;
+  /** Which clock produced this reference. */
+  source: ReferenceTimeSource;
+  /**
+   * Age of the chain reading behind the reference, in seconds — measured on
+   * the browser clock (the only watch available), floored at zero so a device
+   * clock running behind reads as "just read", never as "from the future".
+   * Null when there is no chain reading at all.
+   */
+  ageSecs: number | null;
+  /**
+   * True only for a fresh chain-derived reading: a countdown may state its
+   * expiry from this reference. When false, the UI must mark any countdown as
+   * an estimate and show its age rather than asserting an exact deadline.
+   */
+  authoritative: boolean;
+}
+
+/** A ledger clock reading and when this console performed it. */
+export interface LedgerClockReading {
+  /** `status().now` — the ledger clock at read time. */
+  ledgerNowSecs: number;
+  /** When the read happened, in Unix seconds on the browser clock. */
+  readAtSecs: number;
+}
+
+/**
+ * Resolve the reference time for chain-derived countdowns.
+ *
+ * With a fresh ledger reading the reference is the ledger clock itself; the
+ * reading's age is measured against the browser clock and clamped at zero, so
+ * a device clock running *behind* cannot manufacture staleness. A delayed
+ * reading (RPC outage, backgrounded tab) still resolves to the ledger value —
+ * chain state stays authoritative — but is flagged non-authoritative so the
+ * caller marks the countdown an estimate instead of asserting an exact
+ * expiry. Only with no chain reading at all does the reference fall back to
+ * the browser clock, and then it is never authoritative.
+ */
+export function resolveReferenceTime(
+  reading: LedgerClockReading | null,
+  browserNowSecs: number,
+  maxAgeSecs: number = LEDGER_CLOCK_MAX_AGE_SECS,
+): ReferenceTime {
+  if (reading === null) {
+    return {
+      unixSecs: browserNowSecs,
+      source: "browser",
+      ageSecs: null,
+      authoritative: false,
+    };
+  }
+  const ageSecs = Math.max(0, browserNowSecs - reading.readAtSecs);
+  return {
+    unixSecs: reading.ledgerNowSecs,
+    source: "ledger",
+    ageSecs,
+    authoritative: ageSecs <= maxAgeSecs,
+  };
 }

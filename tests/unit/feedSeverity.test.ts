@@ -6,6 +6,7 @@ import type { GuardEvent } from "stellar-agent-guard-sdk";
 import { installDom, loadReact, sleep, type Act } from "./domHarness.ts";
 import { TelemetryFeed } from "../../components/TelemetryFeed.tsx";
 import { GuardContext, GuardEventsContext } from "../../components/GuardProvider.tsx";
+import { POLL_OFF } from "../../lib/guard/feedHealth.ts";
 import { SEVERITY_TIER, severityFor } from "../../lib/guard/feedSeverity.ts";
 
 installDom();
@@ -142,11 +143,15 @@ function contextFor() {
       guards: [],
       capped: 0,
       cappedLabels: [],
+      health: POLL_OFF,
       gaps: [],
     },
     stream: { paused: false, pendingCount: 0, dropped: 0 },
     startWatching: () => {},
     stopWatching: () => {},
+    tailSelection: [],
+    toggleTailedGuard: () => {},
+    exportRange: null,
     clearEvents: () => {},
     pauseStream: () => {},
     resumeStream: () => {},

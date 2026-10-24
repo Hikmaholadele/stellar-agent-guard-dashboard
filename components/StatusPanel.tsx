@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import Link from "next/link";
 import { deadManRemaining, describePolicy, isDeadManFrozen } from "stellar-agent-guard-sdk";
 import { useGuard } from "./GuardProvider.tsx";
@@ -35,14 +35,31 @@ import {
   type SimulationState,
 } from "../lib/guard/dmsSimulator.ts";
 import {
-  countdownStale,
   evaluateDmsAlert,
   formatDmsDuration,
+  projectDmsAlert,
   type DmsAlert,
 } from "../lib/guard/dmsAlert.ts";
+import { resolveReferenceTime, type LedgerClockReading } from "../lib/guard/ledgerTime.ts";
 import { calculateVelocity } from "../lib/guard/velocity.ts";
 import { useStatusTransitionAnnouncer } from "../lib/guard/statusTransitions.ts";
 import { usePrivacy } from "../lib/guard/privacyStore.ts";
+
+/**
+ * The banner's own clock tick.
+ *
+ * Scoped to the banner (mounted only while a countdown is running) so a
+ * once-a-second update cannot re-render the whole state panel. Every render
+ * reads the clock inside this hook, never during someone else's render.
+ */
+function useNowSecs(): number {
+  const [nowSecs, setNowSecs] = useState(() => Math.floor(Date.now() / 1000));
+  useEffect(() => {
+    const id = window.setInterval(() => setNowSecs(Math.floor(Date.now() / 1000)), 1_000);
+    return () => window.clearInterval(id);
+  }, []);
+  return nowSecs;
+}
 
 /**
  * The proactive dead-man-switch deadline banner, shown above the on-chain
@@ -54,38 +71,67 @@ import { usePrivacy } from "../lib/guard/privacyStore.ts";
  * moment of expiration. Every number comes from the snapshot's ledger clock,
  * never the browser's, because that is the clock the contract judges.
  *
- * When the read behind the countdown has gone stale (#389), the banner says so
- * instead of letting the figures read as current: the numbers stay exactly
- * what the chain last reported — an old deadline is shown as old, never
- * re-derived from the local clock into a fresh-looking one.
+ * Between polls the countdown advances against a resolved reference time
+ * (issue #388): a fresh ledger reading keeps the countdown chain-derived and
+ * exact, while a stale reading freezes at the last chain value and is marked
+ * with its age instead of asserting an expiry the chain has not confirmed.
  */
-function DmsAlertBanner({ alert, stale }: { alert: DmsAlert; stale: boolean }) {
+function DmsAlertBanner({
+  alert,
+  reading,
+}: {
+  alert: DmsAlert;
+  /** The ledger clock at read time; null when no status read succeeded. */
+  reading: LedgerClockReading | null;
+}) {
+  const nowSecs = useNowSecs();
+  const reference = useMemo(() => resolveReferenceTime(reading, nowSecs), [reading, nowSecs]);
+  const projected = projectDmsAlert(alert, reference);
+
   const details: string[] = [];
-  if (alert.remainingSecs !== null && alert.totalSecs !== null) {
-    const pct = Math.max(0, Math.round(alert.fractionRemaining! * 100));
+  if (projected.remainingSecs !== null && alert.totalSecs !== null) {
+    const pct = Math.max(0, Math.round((projected.fractionRemaining ?? 0) * 100));
     details.push(
-      alert.level === "expired"
-        ? `deadline missed by ${formatDmsDuration(-alert.remainingSecs)}`
-        : `${formatDmsDuration(alert.remainingSecs)} of grace left (${pct}%)`,
+      projected.level === "expired"
+        ? `deadline missed by ${formatDmsDuration(-projected.remainingSecs)}`
+        : `${formatDmsDuration(projected.remainingSecs)} of grace left (${pct}%)`,
     );
   }
   if (alert.elapsedSecs !== null) {
     details.push(`last heartbeat ${formatDmsDuration(Math.max(0, alert.elapsedSecs))} ago`);
   }
+  // The reference's age and source are always stated: an operator must be able
+  // to see whether the countdown in front of them is chain-verified or an
+  // estimate over an old read (issue #388).
+  if (projected.exact) {
+    details.push(
+      `chain time read ${formatDmsDuration(projected.ageSecs ?? 0)} ago — expiry is chain-verified`,
+    );
+  } else if (projected.source === "ledger") {
+    details.push(
+      `estimate: chain time is ${formatDmsDuration(projected.ageSecs ?? 0)} old — the deadline may already have passed`,
+    );
+  } else {
+    details.push("no chain time available — countdown runs on the browser clock, not the ledger");
+  }
   if (alert.expiresAtMs !== null) {
-    const prefix = alert.level === "expired" ? "deadline was ≈" : "expires ≈";
+    const prefix = !projected.exact
+      ? "last chain-derived deadline ≈"
+      : projected.level === "expired"
+        ? "deadline was ≈"
+        : "expires ≈";
     details.push(`${prefix} ${new Date(alert.expiresAtMs).toLocaleString()}`);
   }
 
   const title =
-    alert.level === "expired"
+    projected.level === "expired"
       ? "Dead-man switch expired — the agent missed its heartbeat; agent activity is blocked until the heartbeat resumes"
-      : alert.level === "critical"
+      : projected.level === "critical"
         ? "Dead-man switch critical — heartbeat deadline imminent"
         : "Dead-man switch warning — heartbeat deadline approaching";
 
   return (
-    <div className={`dms-banner no-print ${alert.level}`} role="alert">
+    <div className={`dms-banner no-print ${projected.level}`} role="alert">
       <strong>{title}</strong>
       {details.length > 0 && <span className="detail">{details.join(" · ")}</span>}
       {stale && (
@@ -182,11 +228,20 @@ export function StatusPanel() {
       ? evaluateDmsAlert(snapshot.status.value, snapshot.policy.ok ? snapshot.policy.value : null)
       : null;
 
-  // Read freshness for the banner (#389): the local clock measures only how old
-  // the snapshot is — the countdown itself stays ledger-derived — so a stale
-  // read is labelled uncertain instead of presenting a past deadline as current.
-  const nowMs = useNowMs();
-  const dmsAlertStale = snapshot !== null && countdownStale(Date.parse(snapshot.fetchedAt), nowMs);
+  // The ledger clock at the moment of the read (`status().now`) paired with
+  // when the read happened: the anchor the banner's countdown is judged
+  // against (issue #388). Chain state stays authoritative; the browser clock
+  // only measures how old the reading is.
+  const ledgerReading = useMemo<LedgerClockReading | null>(
+    () =>
+      snapshot && snapshot.status.ok
+        ? {
+            ledgerNowSecs: Number(snapshot.status.value.now),
+            readAtSecs: Math.floor(Date.parse(snapshot.fetchedAt) / 1000),
+          }
+        : null,
+    [snapshot],
+  );
 
   // The panel is `aria-busy` exactly while the first read is in flight (no
   // snapshot yet, no failure yet). A background refresh is NOT busy: the values
@@ -228,7 +283,7 @@ export function StatusPanel() {
   return (
     <>
       {dmsAlert && dmsAlert.level !== "none" && (
-        <DmsAlertBanner alert={dmsAlert} stale={dmsAlertStale} />
+        <DmsAlertBanner alert={dmsAlert} reading={ledgerReading} />
       )}
       <div
         className={`panel${rehearsalActive ? " sim-active" : ""}`}

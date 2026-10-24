@@ -32,6 +32,7 @@
  */
 
 import type { GuardStatus, PolicyConfig } from "stellar-agent-guard-sdk";
+import { type ReferenceTime, type ReferenceTimeSource } from "./ledgerTime.ts";
 
 /** Escalation tier of the dead-man-switch deadline alert. */
 export type DmsAlertLevel = "none" | "warning" | "critical" | "expired";
@@ -122,13 +123,7 @@ export function evaluateDmsAlert(
     // read needed to reconstruct the countdown failed.
     level = "expired";
   } else if (remainingSecs !== null && fractionRemaining !== null) {
-    if (remainingSecs <= 0) {
-      level = "expired"; // deadline reached (or passed) on the ledger clock
-    } else if (fractionRemaining < DMS_CRITICAL_FRACTION) {
-      level = "critical";
-    } else if (fractionRemaining < DMS_WARNING_FRACTION || remainingSecs < DMS_WARNING_SECONDS) {
-      level = "warning";
-    }
+    level = classifyDmsLevel(remainingSecs, fractionRemaining);
   }
 
   return {
@@ -141,35 +136,107 @@ export function evaluateDmsAlert(
   };
 }
 
-// ── Read freshness (issue #389) ───────────────────────────────────────────
+/** The escalation tier for a countdown at a given remaining time. */
+function classifyDmsLevel(remainingSecs: number, fractionRemaining: number): DmsAlertLevel {
+  if (remainingSecs <= 0) {
+    return "expired"; // deadline reached (or passed) on the counting clock
+  }
+  if (fractionRemaining < DMS_CRITICAL_FRACTION) {
+    return "critical";
+  }
+  if (fractionRemaining < DMS_WARNING_FRACTION || remainingSecs < DMS_WARNING_SECONDS) {
+    return "warning";
+  }
+  return "none";
+}
+
+/** A countdown re-judged at a reference time (issue #388). */
+export interface ProjectedDmsCountdown {
+  /** Seconds of grace left at the reference time; null when no clock runs. */
+  remainingSecs: number | null;
+  /** `remainingSecs / totalSecs` at the reference time. */
+  fractionRemaining: number | null;
+  /** Escalation tier at the reference time; never de-escalates below the read. */
+  level: DmsAlertLevel;
+  /** Which clock the countdown leaned on. */
+  source: ReferenceTimeSource;
+  /** Age of the chain reading behind the countdown; null when there is none. */
+  ageSecs: number | null;
+  /**
+   * True only when a fresh chain reading backs the countdown, so the UI may
+   * state the expiry as chain-verified. When false the countdown must be
+   * labelled an estimate and shown with its age, never as an exact expiry.
+   */
+  exact: boolean;
+}
 
 /**
- * How old the ledger read behind a countdown may be before the UI presents
- * that countdown as *uncertain* rather than current.
+ * Re-judge an evaluated alert at a resolved reference time.
  *
- * Four times the 15-second snapshot poll: one missed poll is normal jitter,
- * four is a stalled read — a throttled background tab, an RPC that stopped
- * answering after its last success — and a countdown drawn from it describes
- * the past, not the switch the contract will judge. The threshold marks the
- * point where the banner must say so instead of letting a stale figure read
- * as a live one.
+ * The countdown in `DmsAlert` is exact *as of the read*: `remainingSecs` was
+ * computed against the ledger clock `status.now` reported at that moment.
+ * This function answers "what should the banner say now?" without ever
+ * computing from an unbounded browser clock:
+ *
+ *   - **Fresh chain reading** (`reference.authoritative`): the countdown
+ *     advances by the reading's age — elapsed real time within the freshness
+ *     bound is elapsed chain time — and may be stated exactly.
+ *   - **Stale chain reading**: the last chain value is kept, frozen, and
+ *     marked inexact. Projecting it forward on the browser clock is exactly
+ *     the skew this issue exists to prevent (a device an hour ahead would
+ *     declare a live policy expired), so the banner shows the age instead and
+ *     warns the deadline may already have passed.
+ *   - **No chain reading** (browser fallback): the read's own numbers are kept
+ *     and labelled as not chain-verified; the browser clock never becomes the
+ *     authority for a chain deadline.
+ *
+ * The chain's own `heartbeat_expired` verdict is never overridden downward:
+ * once the read says expired, the projection stays expired.
  */
-export const DMS_STALE_READ_MS = 60_000;
+export function projectDmsAlert(alert: DmsAlert, reference: ReferenceTime): ProjectedDmsCountdown {
+  const base = {
+    source: reference.source,
+    ageSecs: reference.ageSecs,
+  };
 
-/**
- * Is the ledger read this countdown derives from too old to present as
- * current?
- *
- * `fetchedAtMs` is the read's own timestamp (the snapshot's `fetchedAt`);
- * `nowMs` is the local clock. The local clock is used only for the *age* of
- * the read — never for the deadline, which stays ledger-derived. Clock skew
- * is therefore bounded in the safe direction: a local clock that jumped
- * backwards makes the read look *fresher*, never staler, and an unparseable
- * timestamp is uncertainty (stale), not a free pass.
- */
-export function countdownStale(fetchedAtMs: number, nowMs: number): boolean {
-  if (!Number.isFinite(fetchedAtMs)) return true;
-  return nowMs - fetchedAtMs >= DMS_STALE_READ_MS;
+  if (alert.remainingSecs === null || alert.fractionRemaining === null) {
+    // No clock ran at read time (switch disabled, no heartbeat, no policy):
+    // there is nothing to project and nothing exact to claim.
+    return {
+      ...base,
+      remainingSecs: null,
+      fractionRemaining: null,
+      level: alert.level,
+      exact: false,
+    };
+  }
+
+  if (reference.source === "ledger" && reference.authoritative) {
+    const remainingSecs = alert.remainingSecs - (reference.ageSecs ?? 0);
+    const fractionRemaining =
+      alert.totalSecs !== null && alert.totalSecs > 0
+        ? remainingSecs / alert.totalSecs
+        : alert.fractionRemaining;
+    const projected = classifyDmsLevel(remainingSecs, fractionRemaining);
+    return {
+      ...base,
+      remainingSecs,
+      fractionRemaining,
+      // Escalate with the projected countdown; never de-escalate a verdict the
+      // chain itself returned.
+      level: alert.level === "expired" ? "expired" : projected,
+      exact: true,
+    };
+  }
+
+  // Stale or browser-sourced: freeze at the last chain value and say so.
+  return {
+    ...base,
+    remainingSecs: alert.remainingSecs,
+    fractionRemaining: alert.fractionRemaining,
+    level: alert.level,
+    exact: false,
+  };
 }
 
 /**
