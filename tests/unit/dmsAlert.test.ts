@@ -3,13 +3,13 @@ import { test } from "node:test";
 import type { GuardStatus, PolicyConfig } from "stellar-agent-guard-sdk";
 import {
   DMS_CRITICAL_FRACTION,
-  DMS_STALE_READ_MS,
   DMS_WARNING_FRACTION,
   DMS_WARNING_SECONDS,
-  countdownStale,
   evaluateDmsAlert,
   formatDmsDuration,
+  projectDmsAlert,
 } from "../../lib/guard/dmsAlert.ts";
+import { LEDGER_CLOCK_MAX_AGE_SECS, resolveReferenceTime } from "../../lib/guard/ledgerTime.ts";
 
 /** A `status()` read with controllable ledger-clock fields. */
 function status(overrides: Partial<GuardStatus> = {}): GuardStatus {
@@ -274,35 +274,54 @@ test("clock skew cannot green-wash a tripped switch nor cry-wolf a healthy one",
   }
 });
 
-test("countdownStale draws the uncertainty line at the staleness threshold", () => {
-  const fetched = Date.UTC(2026, 9, 20, 12, 0, 0);
-  assert.equal(countdownStale(fetched, fetched), false, "a just-fetched read is current");
+test("the uncertainty line is drawn at the staleness threshold", () => {
+  const readAt = 1_700_000_000;
+  const ledgerNow = 1_700_000_123;
+  const reading = { ledgerNowSecs: ledgerNow, readAtSecs: readAt };
+  const at = (ageSecs: number) => resolveReferenceTime(reading, readAt + ageSecs);
+  assert.equal(at(0).authoritative, true, "a just-fetched read is current");
   assert.equal(
-    countdownStale(fetched, fetched + DMS_STALE_READ_MS - 1),
+    at(LEDGER_CLOCK_MAX_AGE_SECS).authoritative,
+    true,
+    "a reading exactly at the freshness bound still counts",
+  );
+  assert.equal(
+    at(LEDGER_CLOCK_MAX_AGE_SECS + 1).authoritative,
     false,
-    "one millisecond before the threshold is still presented as current",
+    "one second past the bound the countdown is already uncertain",
   );
-  assert.equal(
-    countdownStale(fetched, fetched + DMS_STALE_READ_MS),
-    true,
-    "at the threshold the countdown is already uncertain",
+  assert.equal(at(10 * 60).authoritative, false, "a long-untouched read is stale");
+
+  // The uncertainty survives into the projection: a stale read's countdown is
+  // frozen at the last chain value and never stated as exact.
+  const alert = evaluateDmsAlert(
+    status({ last_heartbeat: 1_000_000n, now: 1_025_000n }),
+    policy(100_000n),
   );
-  assert.equal(countdownStale(fetched, fetched + DMS_STALE_READ_MS + 1), true);
+  const projected = projectDmsAlert(alert, at(10 * 60));
+  assert.equal(projected.exact, false);
   assert.equal(
-    countdownStale(fetched, fetched + 10 * 60_000),
-    true,
-    "a long-untouched read is stale",
+    projected.remainingSecs,
+    alert.remainingSecs,
+    "a stale read's figure is kept as read, not re-derived",
   );
 });
 
 test("skew and garbage make a read uncertain, never fresh by accident", () => {
-  const fetched = Date.UTC(2026, 9, 20, 12, 0, 0);
+  const readAt = 1_700_000_000;
+  const reading = { ledgerNowSecs: 1_700_000_123, readAtSecs: readAt };
   // A local clock that jumped backwards ages the read *less*, never more:
   // skew can hide staleness at worst, it cannot invent freshness elsewhere.
-  assert.equal(countdownStale(fetched, fetched - 120_000), false);
+  const behind = resolveReferenceTime(reading, readAt - 120);
+  assert.equal(behind.ageSecs, 0, "age clamps at zero");
+  assert.equal(behind.authoritative, true);
   // An unparseable fetch timestamp is uncertainty, not a free pass.
-  assert.equal(countdownStale(Number.NaN, fetched), true);
-  assert.equal(countdownStale(Number.POSITIVE_INFINITY, fetched), true);
+  const garbage = resolveReferenceTime(
+    { ledgerNowSecs: 1_700_000_123, readAtSecs: Number.NaN },
+    readAt,
+  );
+  assert.equal(Number.isNaN(garbage.ageSecs), true);
+  assert.equal(garbage.authoritative, false, "a garbage read timestamp can never come back fresh");
 });
 
 test("a failed ledger read is an uncertainty state, and the next good read recovers it", () => {

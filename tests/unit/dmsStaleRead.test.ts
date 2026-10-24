@@ -2,7 +2,8 @@
  * The dead-man countdown banner under a stale ledger read (issue #389).
  *
  * The rule being pinned: a countdown that derives from a read the console has
- * not refreshed within `DMS_STALE_READ_MS` is presented as *uncertain* — the
+ * not refreshed within the ledger clock's freshness bound (`LEDGER_CLOCK_MAX_AGE_SECS`)
+ * is presented as *uncertain* — the
  * banner keeps the ledger-derived numbers (an old deadline is shown as old,
  * never re-derived from the local clock) and says the read is stale. The next
  * fresh read removes the caveat without touching the countdown itself.

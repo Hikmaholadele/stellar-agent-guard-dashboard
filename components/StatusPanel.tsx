@@ -87,6 +87,12 @@ function DmsAlertBanner({
   const nowSecs = useNowSecs();
   const reference = useMemo(() => resolveReferenceTime(reading, nowSecs), [reading, nowSecs]);
   const projected = projectDmsAlert(alert, reference);
+  // A chain reading that outlived the freshness bound is a stale read (#389):
+  // the projection already freezes its numbers at the last chain value and
+  // refuses to state an exact expiry; this flag adds the explicit "stale read"
+  // note so the operator knows to refresh rather than read the figures as a
+  // fresh deadline.
+  const stale = reference.source === "ledger" && !reference.authoritative;
 
   const details: string[] = [];
   if (projected.remainingSecs !== null && alert.totalSecs !== null) {
@@ -142,15 +148,6 @@ function DmsAlertBanner({
       )}
     </div>
   );
-}
-
-function useNowMs(): number {
-  const [nowMs, setNowMs] = useState(() => Date.now());
-  useEffect(() => {
-    const interval = window.setInterval(() => setNowMs(Date.now()), 5_000);
-    return () => window.clearInterval(interval);
-  }, []);
-  return nowMs;
 }
 
 /**

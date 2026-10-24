@@ -13,9 +13,10 @@
  * skewed local clock must not be able to green-wash a late heartbeat or
  * cry-wolf an early one. The calendar estimate is one wall-clock translation,
  * and it is labelled an estimate because ledger close time tracks wall clock
- * only approximately; the freshness check (`countdownStale`) is the other —
- * it compares the read's own timestamp against the local clock to say how old
- * the read is, an age rather than a deadline.
+ * only approximately; the freshness check (`resolveReferenceTime` in
+ * `ledgerTime.ts`) is the other — it compares the read's own timestamp
+ * against the local clock to say how old the read is, an age rather than a
+ * deadline.
  *
  * Thresholds (from the alerting spec):
  * - `warning` (yellow) when less than 25% of the grace remains, or less than
