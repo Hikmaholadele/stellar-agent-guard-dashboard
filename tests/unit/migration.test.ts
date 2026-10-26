@@ -2,10 +2,16 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
   TARGET_POLICY_FIELDS,
+  buildMigrationPreview,
+  canSubmitMigrationPreview,
+  describeMigrationScope,
+  migrationPreviewValidity,
   planMigration,
   sourceRows,
   validateSourcePolicy,
   type FieldConversionStatus,
+  type MigrationNetwork,
+  type MigrationScope,
 } from "../../lib/guard/migration.ts";
 
 const TOKEN = "CDCYDGBGS5AZ5BZS6XY2SK2PHJHSOEGTN3N4INCK34KF6GU2BGC7Z6MB";
@@ -340,6 +346,97 @@ test("the review rows describe the policy the target will get", () => {
   assert.equal(rows.get("Active window"), "always", "a zero from and until means no time limit");
   assert.equal(rows.get("Paused"), "no");
   assert.equal(rows.get("Dead-man grace"), "3600s");
+});
+
+// ── Issue #363: a preview is bound to its destination and network ───────────
+
+const TESTNET: MigrationNetwork = {
+  name: "testnet",
+  passphrase: "Test SDF Network ; September 2015",
+};
+const TARGET_A = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+const TARGET_B = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+
+function scope(destination: string, network: MigrationNetwork = TESTNET): MigrationScope {
+  return { destination, network };
+}
+
+function previewFor(destination: string, readAt = "2026-10-21T10:00:00.000Z") {
+  const plan = planMigration(source());
+  assert.equal(plan.ok, true);
+  return buildMigrationPreview({ plan, destination, network: TESTNET, readAt });
+}
+
+test("a preview records the destination, network and read time it was built for", () => {
+  const preview = previewFor(TARGET_A);
+  assert.equal(preview.destination, TARGET_A);
+  assert.deepEqual(preview.network, TESTNET);
+  assert.equal(preview.readAt, "2026-10-21T10:00:00.000Z");
+  assert.equal(describeMigrationScope(preview), `${TARGET_A} on testnet`);
+  assert.deepEqual(migrationPreviewValidity(preview, scope(TARGET_A)), { ok: true });
+  assert.deepEqual(canSubmitMigrationPreview(preview, scope(TARGET_A)), { ok: true });
+});
+
+test("a mid-flow guard switch invalidates the preview and blocks submission", () => {
+  const preview = previewFor(TARGET_A);
+  assert.equal(canSubmitMigrationPreview(preview, scope(TARGET_A)).ok, true);
+
+  // The active guard moves to TARGET_B after the source was read. The same
+  // preview must not authorize a write against the new destination.
+  const switched = canSubmitMigrationPreview(preview, scope(TARGET_B));
+  assert.equal(switched.ok, false);
+  if (switched.ok) return;
+  assert.match(switched.reason, /destination changed/i);
+  assert.match(switched.reason, /re-read/i);
+  assert.equal(migrationPreviewValidity(preview, scope(TARGET_B)).ok, false);
+
+  // Submitting requires a fresh live read + review for TARGET_B, which produces
+  // a new preview. Only then is the gate open again.
+  const fresh = previewFor(TARGET_B, "2026-10-21T10:01:00.000Z");
+  assert.deepEqual(canSubmitMigrationPreview(fresh, scope(TARGET_B)), { ok: true });
+  assert.equal(canSubmitMigrationPreview(fresh, scope(TARGET_A)).ok, false);
+});
+
+test("a network change invalidates the preview even when the address is unchanged", () => {
+  const preview = previewFor(TARGET_A);
+
+  const renamed = canSubmitMigrationPreview(preview, {
+    destination: TARGET_A,
+    network: { ...TESTNET, name: "futurenet" },
+  });
+  assert.equal(renamed.ok, false);
+  if (!renamed.ok) assert.match(renamed.reason, /network changed/i);
+
+  const rephrased = canSubmitMigrationPreview(preview, {
+    destination: TARGET_A,
+    network: { ...TESTNET, passphrase: "Public Global Stellar Network ; September 2015" },
+  });
+  assert.equal(rephrased.ok, false);
+  if (!rephrased.ok) assert.match(rephrased.reason, /passphrase changed/i);
+});
+
+test("a preview of a non-portable plan can never be submitted", () => {
+  const plan = planMigration(source({ per_tx_cap: "one thousand" }));
+  assert.equal(plan.ok, false);
+  const preview = buildMigrationPreview({
+    plan,
+    destination: TARGET_A,
+    network: TESTNET,
+  });
+  const gate = canSubmitMigrationPreview(preview, scope(TARGET_A));
+  assert.equal(gate.ok, false);
+  if (!gate.ok) assert.match(gate.reason, /not a directly portable policy/i);
+});
+
+test("an empty destination is reported as an invalid binding, not as a match", () => {
+  const preview = buildMigrationPreview({
+    plan: planMigration(source()),
+    destination: "",
+    network: TESTNET,
+  });
+  const gate = canSubmitMigrationPreview(preview, { destination: "", network: TESTNET });
+  assert.equal(gate.ok, false);
+  if (!gate.ok) assert.match(gate.reason, /no destination address/i);
 });
 
 test("an empty allowlist is shown as a denial, not as a blank", () => {

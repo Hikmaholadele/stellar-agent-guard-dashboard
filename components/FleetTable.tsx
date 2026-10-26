@@ -131,9 +131,16 @@ export function FleetTable() {
         return <span className="pill danger">Frozen</span>;
       case "Expired":
         return <span className="pill warn">Expired</span>;
+      case "Unknown":
+        return <span className="pill muted">Unknown</span>;
       default:
         return <span className="pill muted">Unknown</span>;
     }
+  };
+
+  const renderError = (error?: string | null) => {
+    if (!error) return null;
+    return <span className="pill danger tiny">Read error: {error}</span>;
   };
 
   return (
@@ -333,14 +340,21 @@ export function FleetTable() {
                       >
                         Inspect
                       </button>
-                      <button
-                        className="secondary"
-                        style={{ padding: "4px 8px", fontSize: "0.8em" }}
-                        onClick={() => handleFreeze(row.contact.address)}
-                        disabled={row.derivedStatus === "Frozen"}
-                      >
-                        Freeze
-                      </button>
+                      {row.retry && (
+                        <button
+                          className="secondary"
+                          style={{ padding: "4px 8px", fontSize: "0.8em" }}
+                          onClick={() => row.retry!()}
+                          disabled={row.derivedStatus !== "Unknown"}
+                        >
+                          Retry
+                        </button>
+                      )}
+                      {row.error && (
+                        <span className="tiny muted" title={row.error}>
+                          ⚠
+                        </span>
+                      )}
                     </div>
                   </td>
                 </tr>

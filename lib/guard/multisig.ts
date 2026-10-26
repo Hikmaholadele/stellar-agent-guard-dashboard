@@ -1,3 +1,6 @@
+import { TransactionBuilder, xdr } from "@stellar/stellar-sdk";
+import { toHex } from "./scval.ts";
+
 /**
  * Multi-signature approval tracking for admin transactions.
  *
@@ -456,4 +459,175 @@ export function approvalPercent(state: MultisigApprovalState): number {
   if (state.evaluationStatus !== "supported" || state.requiredWeight === null) return 0;
   if (state.requiredWeight <= 0) return 100;
   return Math.min(100, Math.round((state.collectedWeight / state.requiredWeight) * 100));
+}
+
+// ── Envelope merging (#373) ────────────────────────────────────────────────
+
+/**
+ * One signed envelope, and the network it was built for.
+ *
+ * The network is not encoded in the XDR, so a merge that did not ask for it
+ * could not tell a testnet signature from a pubnet one. Making it an explicit
+ * input is what lets the merge refuse a cross-network hand-off instead of
+ * appending signatures that can never validate.
+ */
+export interface SignedEnvelopeInput {
+  xdr: string;
+  networkPassphrase: string;
+}
+
+export type EnvelopeMergeResult =
+  | {
+      ok: true;
+      /** The merged envelope, carrying exactly the base transaction body. */
+      envelopeXdr: string;
+      /** Transaction hash under the base envelope's network passphrase. */
+      hash: string;
+      addedSignatures: number;
+      duplicateSignatures: number;
+      totalSignatures: number;
+    }
+  | {
+      ok: false;
+      error: string;
+      /** The intent fields that differ, when the envelopes are not the same tx. */
+      differences: string[];
+    };
+
+type V1Envelope = xdr.TransactionEnvelopeTx;
+
+function decodeEnvelope(input: SignedEnvelopeInput, label: string): V1Envelope | string {
+  try {
+    const envelope = xdr.TransactionEnvelope.fromXDR(input.xdr.trim(), "base64");
+    if (envelope.type !== "envelopeTypeTx") {
+      return `The ${label} envelope is a ${envelope.type}; only a regular v1 transaction envelope can be merged here.`;
+    }
+    return envelope;
+  } catch (error) {
+    return `The ${label} envelope could not be decoded: ${
+      error instanceof Error ? error.message : String(error)
+    }`;
+  }
+}
+
+function signatureKey(signature: xdr.DecoratedSignature): string {
+  return `${signature.hint.toXDR("hex")}:${signature.signature.toXDR("hex")}`;
+}
+
+/**
+ * Describe every intent field that differs between two transaction bodies.
+ *
+ * Operations are compared as whole XDR values (which includes their Soroban
+ * authorization entries), and auth entries are also compared separately so a
+ * failure names the security-sensitive part rather than just "operations".
+ */
+function intentDifferences(base: xdr.Transaction, incoming: xdr.Transaction): string[] {
+  const differences = new Set<string>();
+  if (base.sourceAccount.toXDR("base64") !== incoming.sourceAccount.toXDR("base64")) {
+    differences.add("source account");
+  }
+  if (base.fee !== incoming.fee) differences.add("fee");
+  if (base.seqNum !== incoming.seqNum) differences.add("sequence number");
+  if (base.cond.toXDR("base64") !== incoming.cond.toXDR("base64")) {
+    differences.add("time bounds / preconditions");
+  }
+  if (base.memo.toXDR("base64") !== incoming.memo.toXDR("base64")) differences.add("memo");
+  if (base.ext.toXDR("base64") !== incoming.ext.toXDR("base64")) {
+    differences.add("Soroban transaction data");
+  }
+
+  if (base.operations.length !== incoming.operations.length) {
+    differences.add("operations");
+    return [...differences];
+  }
+
+  let operationsDiffer = false;
+  let authEntriesDiffer = false;
+  for (let index = 0; index < base.operations.length; index += 1) {
+    const baseOp = base.operations[index]!;
+    const incomingOp = incoming.operations[index]!;
+    if (baseOp.toXDR("base64") !== incomingOp.toXDR("base64")) operationsDiffer = true;
+
+    const baseAuth =
+      baseOp.body.type === "invokeHostFunction" ? baseOp.body.invokeHostFunctionOp.auth : [];
+    const incomingAuth =
+      incomingOp.body.type === "invokeHostFunction"
+        ? incomingOp.body.invokeHostFunctionOp.auth
+        : [];
+    const authOf = (entries: xdr.SorobanAuthorizationEntry[]): string =>
+      entries.map((entry) => entry.toXDR("base64")).join("\u0000");
+    if (authOf(baseAuth) !== authOf(incomingAuth)) authEntriesDiffer = true;
+  }
+  if (operationsDiffer) differences.add("operations");
+  if (authEntriesDiffer) differences.add("Soroban authorization entries");
+  return [...differences];
+}
+
+/**
+ * Merge two signatures sets over the *same* transaction.
+ *
+ * Security boundary: only the signature array may change. The base transaction
+ * body is compared byte-for-byte before anything is merged, including its
+ * network, fee, sequence, memo, operations and Soroban auth entries, so an
+ * envelope that differs in intent is rejected rather than "close enough".
+ * Signatures are deduplicated by hint **and** signature bytes — two distinct
+ * signatures that happen to share a 4-byte hint are both kept, so a valid
+ * unique signer is never dropped.
+ */
+export function mergeSignedEnvelopes(
+  baseInput: SignedEnvelopeInput,
+  incomingInput: SignedEnvelopeInput,
+): EnvelopeMergeResult {
+  if (baseInput.networkPassphrase !== incomingInput.networkPassphrase) {
+    return {
+      ok: false,
+      error:
+        "The envelopes target different networks, so they cannot carry the same transaction. A signature collected for one network cannot authorize a transaction on another; rebuild both for the same network.",
+      differences: ["network"],
+    };
+  }
+
+  const base = decodeEnvelope(baseInput, "base");
+  if (typeof base === "string") return { ok: false, error: base, differences: [] };
+  const incoming = decodeEnvelope(incomingInput, "incoming");
+  if (typeof incoming === "string") return { ok: false, error: incoming, differences: [] };
+
+  const differences = intentDifferences(base.v1.tx, incoming.v1.tx);
+  if (differences.length > 0) {
+    return {
+      ok: false,
+      error: `The envelopes do not carry the same transaction (${differences.join(", ")}). Merging signatures would change what the signers approved, so it is refused.`,
+      differences,
+    };
+  }
+
+  const merged = [...base.v1.signatures];
+  const seen = new Set(merged.map(signatureKey));
+  let addedSignatures = 0;
+  let duplicateSignatures = 0;
+  for (const signature of incoming.v1.signatures) {
+    const key = signatureKey(signature);
+    if (seen.has(key)) {
+      duplicateSignatures += 1;
+      continue;
+    }
+    seen.add(key);
+    merged.push(signature);
+    addedSignatures += 1;
+  }
+
+  const envelope = xdr.TransactionEnvelope.envelopeTypeTx(
+    new xdr.TransactionV1Envelope({ tx: base.v1.tx, signatures: merged }),
+  );
+  const envelopeXdr = envelope.toXDR("base64");
+  const hash = TransactionBuilder.fromXDR(envelopeXdr, baseInput.networkPassphrase).hash();
+
+  return {
+    ok: true,
+    envelopeXdr,
+    hash: toHex(new Uint8Array(hash)),
+    addedSignatures,
+    duplicateSignatures,
+    totalSignatures: merged.length,
+  };
 }

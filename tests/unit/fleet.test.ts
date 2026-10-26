@@ -111,6 +111,47 @@ describe("fleet polling", () => {
     assert.equal(rows[1]!.derivedStatus, "Active");
     assert.equal(rows[1]!.dmsCountdownSecs, null);
   });
+
+  it("isolates per-guard failures: no failed row presented as healthy", async () => {
+    const server = new rpc.Server("https://localhost:8000");
+    const contacts: Contact[] = [
+      { address: "C1", label: "Healthy Guard", addedAt: "2023-01-01T00:00:00Z" },
+      { address: "C2", label: "Failed Guard", addedAt: "2023-01-02T00:00:00Z" },
+      { address: "C3", label: "Another Healthy", addedAt: "2023-01-03T00:00:00Z" },
+    ];
+
+    const mockReadSnapshot = async (srv: any, address: string) => {
+      if (address === "C2") {
+        throw new Error("RPC timeout");
+      }
+      return {
+        guard: address,
+        status: {
+          ok: true,
+          value: { admin_frozen: false, heartbeat_expired: false, last_heartbeat: 100n, now: 120n },
+        },
+        policy: { ok: true, value: { dms_grace_secs: 60n } },
+        window: { ok: true, value: { total: 5000n, entries: [] } },
+      };
+    };
+
+    const rows = await pollFleet(server, contacts, mockReadSnapshot as any);
+
+    assert.equal(rows.length, 3);
+
+    // C1 and C3 should be Active, C2 should be Unknown with error
+    assert.equal(rows[0]!.derivedStatus, "Active");
+    assert.equal(rows[0]!.error, undefined);
+    assert.equal(rows[1]!.derivedStatus, "Unknown");
+    assert.equal(rows[1]!.error, "RPC timeout");
+    assert.equal(rows[2]!.derivedStatus, "Active");
+    assert.equal(rows[2]!.error, undefined);
+
+    // Retry should preserve the original failure reason
+    const retryResult = await rows[1]!.retry!();
+    assert.equal(retryResult.derivedStatus, "Unknown");
+    assert.equal(retryResult.error, "RPC timeout");
+  });
 });
 
 describe("fleet filtering and sorting", () => {

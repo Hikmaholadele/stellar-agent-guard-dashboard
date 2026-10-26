@@ -77,7 +77,7 @@ function addressField(label: string) {
 /** A cap/duration field: digits only, blank means "off" (0). Rejects negative values by construction. */
 function nonNegativeAmountField(label: string) {
   return z.string().refine((value) => /^\d*$/.test(value), {
-    message: `${label} must be a non-negative whole number of units (digits only), or blank to disable`,
+    message: `${label} must be a non-negative whole number of units (digits only), blank to disable; maximum i128 value`,
   });
 }
 
@@ -90,27 +90,41 @@ const protocolRuleSchema = z.object({
 
 const assetCapEntrySchema = z.object({
   asset_contract_address: addressField("per_asset_caps asset_contract_address"),
-  max_cap_stroops: z.string().refine((value) => /^\d+$/.test(value) && BigInt(value) > 0n, {
-    message: "per_asset_caps max_cap_stroops must be a positive whole number",
-  }),
+  max_cap_stroops: z
+    .string()
+    .refine(
+      (value) =>
+        /^\d+$/.test(value) &&
+        BigInt(value) > 0n &&
+        BigInt(value) <= BigInt(Number.MAX_SAFE_INTEGER),
+      {
+        message:
+          "per_asset_caps max_cap_stroops must be a positive whole number not exceeding i128 max",
+      },
+    ),
   symbol: z.string().min(1, "per_asset_caps symbol is required"),
+});
+
+const amountFieldSchema = z.string().refine((value) => /^\d*$/.test(value), {
+  message:
+    "amount must be a non-negative whole number of units (digits only), blank to disable; maximum i128 value",
 });
 
 export const policyExportSchemaV1 = z.object({
   version: z.number().refine((value) => value === POLICY_SCHEMA_VERSION, {
     message: `Unknown schema version; this build only supports version ${POLICY_SCHEMA_VERSION}`,
   }),
-  max_amount_per_tx: nonNegativeAmountField("max_amount_per_tx"),
-  window_cap: nonNegativeAmountField("window_cap"),
-  window_seconds: nonNegativeAmountField("window_seconds"),
-  dead_man_switch_seconds: nonNegativeAmountField("dead_man_switch_seconds"),
+  max_amount_per_tx: amountFieldSchema,
+  window_cap: amountFieldSchema,
+  window_seconds: amountFieldSchema,
+  dead_man_switch_seconds: amountFieldSchema,
   allowed_protocols: z.array(protocolRuleSchema),
   denied_recipients: z.array(addressField("denied_recipients")),
   per_asset_caps: z.array(assetCapEntrySchema),
   assets: z.array(addressField("assets")),
   allow_any_recipient: z.boolean(),
-  active_from: nonNegativeAmountField("active_from"),
-  active_until: nonNegativeAmountField("active_until"),
+  active_from: amountFieldSchema,
+  active_until: amountFieldSchema,
   paused: z.boolean(),
 });
 

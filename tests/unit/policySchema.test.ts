@@ -203,3 +203,73 @@ test("importPolicyFromJson reports multiple validation issues at once, each with
   assert.ok(result.issues.some((issue) => issue.path === "max_amount_per_tx"));
   assert.ok(result.issues.some((issue) => issue.path === "denied_recipients[0]"));
 });
+
+test("importPolicyFromJson rejects a fractional amount", () => {
+  const parsed = JSON.parse(exportPolicyToJson(fullConfig, assetCaps));
+  parsed.max_amount_per_tx = "1.5";
+  const result = importPolicyFromJson(JSON.stringify(parsed));
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  const capIssue = result.issues.find((issue) => issue.path === "max_amount_per_tx");
+  assert.ok(capIssue, 'expected a validation issue at path "max_amount_per_tx"');
+  assert.match(capIssue!.message, /whole number/);
+});
+
+test("importPolicyFromJson rejects an empty amount (blank is allowed)", () => {
+  const parsed = JSON.parse(exportPolicyToJson(fullConfig, assetCaps));
+  parsed.max_amount_per_tx = "";
+  const result = importPolicyFromJson(JSON.stringify(parsed));
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.draft.perTxCap, "");
+});
+
+test("importPolicyFromJson rejects a negative per-asset cap", () => {
+  const parsed = JSON.parse(exportPolicyToJson(fullConfig, assetCaps));
+  parsed.per_asset_caps[0].max_cap_stroops = "-10";
+  const result = importPolicyFromJson(JSON.stringify(parsed));
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  const capIssue = result.issues.find(
+    (issue) => issue.path === "per_asset_caps[0].max_cap_stroops",
+  );
+  assert.ok(capIssue, 'expected a validation issue at path "per_asset_caps[0].max_cap_stroops"');
+  assert.match(capIssue!.message, /positive/);
+});
+
+test("importPolicyFromJson rejects a fractional per-asset cap", () => {
+  const parsed = JSON.parse(exportPolicyToJson(fullConfig, assetCaps));
+  parsed.per_asset_caps[0].max_cap_stroops = "5.5";
+  const result = importPolicyFromJson(JSON.stringify(parsed));
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  const capIssue = result.issues.find(
+    (issue) => issue.path === "per_asset_caps[0].max_cap_stroops",
+  );
+  assert.ok(capIssue, 'expected a validation issue at path "per_asset_caps[0].max_cap_stroops"');
+  assert.match(capIssue!.message, /whole number/);
+});
+
+test("importPolicyFromJson rejects a malformed protocol function name", () => {
+  const parsed = JSON.parse(exportPolicyToJson(fullConfig, assetCaps));
+  parsed.allowed_protocols = [{ contract: PROTOCOL, functions: [""] }];
+  const result = importPolicyFromJson(JSON.stringify(parsed));
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  const protocolIssue = result.issues.find(
+    (issue) => issue.path === "allowed_protocols[0].functions[0]",
+  );
+  assert.ok(
+    protocolIssue,
+    'expected a validation issue at path "allowed_protocols[0].functions[0]"',
+  );
+});
+
+test("importPolicyFromJson accepts a valid large positive whole number", () => {
+  const parsed = JSON.parse(exportPolicyToJson(fullConfig, assetCaps));
+  parsed.max_amount_per_tx = "999999999999";
+  const result = importPolicyFromJson(JSON.stringify(parsed));
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.draft.perTxCap, "999999999999");
+});

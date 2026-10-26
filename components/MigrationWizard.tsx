@@ -12,23 +12,31 @@
  * manual re-entry it replaces.
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 import { installPolicy } from "../lib/guard/guardOps.ts";
-import { readPolicy } from "../lib/guard/chain.ts";
+import { readPolicy, readStatus } from "../lib/guard/chain.ts";
+import { NETWORK } from "../lib/guard/network.ts";
 import {
+  buildMigrationPreview,
+  canSubmitMigrationPreview,
+  describeMigrationScope,
+  migrationPreviewValidity,
   planMigration,
   sourceRows,
-  type MigrationPlan,
   type CompatibilityReport,
   type FieldConversion,
   type FieldConversionStatus,
+  type MigrationPreview,
+  type MigrationScope,
 } from "../lib/guard/migration.ts";
 import { useGuard } from "./GuardProvider.tsx";
 import { ErrorBlock, starLink } from "./bits.tsx";
 
-/** Either the chain's policy, or why there is not one. */
+/** Either a live source + destination read, or why there is not one. */
 type SourceRead =
-  { kind: "read"; plan: MigrationPlan } | { kind: "empty" } | { kind: "error"; message: string };
+  | { kind: "read"; preview: MigrationPreview }
+  | { kind: "empty" }
+  | { kind: "error"; message: string };
 
 export function MigrationWizard({ target }: { target: string }) {
   const { server, signer, wallet, instances, refresh } = useGuard();
@@ -44,15 +52,42 @@ export function MigrationWizard({ target }: { target: string }) {
   // window the guard is enforcing.
   const candidates = instances.filter((instance) => instance.guard !== target);
 
+  const currentScope: MigrationScope = {
+    destination: target,
+    network: { name: NETWORK.name, passphrase: NETWORK.passphrase },
+  };
+
   const readSource = useCallback(async (): Promise<SourceRead> => {
     if (!source.trim()) {
       return { kind: "error", message: "Choose the guard to copy from." };
     }
-    const result = await readPolicy(server, source.trim());
+    if (!target.trim()) {
+      return { kind: "error", message: "Choose the destination guard before reading a source." };
+    }
+    // The destination is read at the same time as the source. A preview is only
+    // reviewable for a destination the chain answered for *now*: switching the
+    // active guard must require a fresh read, not reuse the previous one.
+    const [result, destination] = await Promise.all([
+      readPolicy(server, source.trim()),
+      readStatus(server, target.trim()),
+    ]);
     if (!result.ok) return { kind: "error", message: result.error };
+    if (!destination.ok) {
+      return {
+        kind: "error",
+        message: `The destination ${target} could not be read: ${destination.error}`,
+      };
+    }
     if (result.value === null || result.value === undefined) return { kind: "empty" };
-    return { kind: "read", plan: planMigration(result.value) };
-  }, [server, source]);
+    return {
+      kind: "read",
+      preview: buildMigrationPreview({
+        plan: planMigration(result.value),
+        destination: target,
+        network: { name: NETWORK.name, passphrase: NETWORK.passphrase },
+      }),
+    };
+  }, [server, source, target]);
 
   function applyRead(next: SourceRead) {
     setRead(next);
@@ -68,16 +103,33 @@ export function MigrationWizard({ target }: { target: string }) {
     applyRead(await readSource());
   }
 
+  function previewOf(next: SourceRead | null): MigrationPreview | null {
+    return next?.kind === "read" ? next.preview : null;
+  }
+
   async function applyToTarget() {
-    if (!read || read.kind !== "read" || !read.plan.ok) return;
+    const preview = previewOf(read);
+    if (!preview) return;
+
+    // Re-check at the moment of submission, not just at render: the active guard
+    // can switch in another tab between the operator reading the summary and
+    // pressing apply. A stale preview refuses here rather than installing a
+    // policy the operator never reviewed for this destination.
+    const gate = canSubmitMigrationPreview(preview, currentScope);
+    if (!gate.ok) {
+      setError(`${gate.reason} Nothing was signed.`);
+      return;
+    }
+    if (!preview.plan.ok) return;
+
     setApplying(true);
     setError(null);
     try {
       const outcome = await installPolicy({
         server,
         signer: signer(),
-        guard: target,
-        draft: read.plan.draft,
+        guard: preview.destination,
+        draft: preview.plan.draft,
       });
       setApplied(outcome);
       if (outcome.kind === "invoked" && outcome.result.kind === "submitted") await refresh();
@@ -88,7 +140,10 @@ export function MigrationWizard({ target }: { target: string }) {
     }
   }
 
-  const plan = read?.kind === "read" && read.plan.ok ? read.plan : null;
+  const preview = previewOf(read);
+  const validity = preview ? migrationPreviewValidity(preview, currentScope) : null;
+  const submitGate = preview ? canSubmitMigrationPreview(preview, currentScope) : null;
+  const plan = preview && validity?.ok && preview.plan.ok ? preview.plan : null;
 
   return (
     <div className="stack" style={{ marginTop: 18 }}>
@@ -140,25 +195,48 @@ export function MigrationWizard({ target }: { target: string }) {
         </div>
       )}
 
-      {read?.kind === "read" && !read.plan.ok && (
+      {preview && !preview.plan.ok && (
         <>
-          <ErrorBlock title="This policy is not directly portable" detail={read.plan.message} />
-          <CompatibilityView report={read.plan.report} />
+          <ErrorBlock title="This policy is not directly portable" detail={preview.plan.message} />
+          <CompatibilityView report={preview.plan.report} />
         </>
       )}
 
-      {plan && (
+      {preview && validity && !validity.ok && (
+        <div className="error" role="alert">
+          <span className="t">This preview is out of date</span>
+          <span className="tiny">{validity.reason}</span>
+          <span className="tiny">
+            It was read for {describeMigrationScope(preview)}. The policy summary and the apply
+            button stay hidden until the source and destination are read again and reviewed for the
+            current destination.
+          </span>
+        </div>
+      )}
+
+      {plan && preview && (
         <div className="stack">
           <div className="grid">
             <div className="stat">
               <div className="k">From</div>
               <div className="v small mono">{source}</div>
-              <div className="n">read from the chain just now</div>
+              <div className="n">
+                read from the chain at <span className="mono">{preview.readAt}</span>
+              </div>
             </div>
             <div className="stat">
               <div className="k">To</div>
-              <div className="v small mono">{target}</div>
-              <div className="n">the target instance&apos;s policy will be replaced</div>
+              <div className="v small mono">{preview.destination}</div>
+              <div className="n">
+                on {preview.network.name} — the target instance&apos;s policy will be replaced
+              </div>
+            </div>
+            <div className="stat">
+              <div className="k">Bound to</div>
+              <div className="v small">destination + network</div>
+              <div className="n">
+                Change either one and this preview is invalidated until a fresh read.
+              </div>
             </div>
           </div>
 
@@ -203,12 +281,16 @@ export function MigrationWizard({ target }: { target: string }) {
           <CompatibilityView report={plan.report} />
 
           <div className="row">
-            <button disabled={!wallet || applying} onClick={() => void applyToTarget()}>
+            <button
+              disabled={!wallet || applying || !submitGate?.ok}
+              onClick={() => void applyToTarget()}
+            >
               {applying ? "Preparing..." : "Apply policy to target"}
             </button>
             <span className="tiny muted">
-              The wallet is prompted once; the payload is this build&apos;s own validated encoding
-              of the source policy.
+              {submitGate?.ok
+                ? "The wallet is prompted once; the payload is this build's own validated encoding of the source policy."
+                : submitGate?.reason}
             </span>
           </div>
         </div>

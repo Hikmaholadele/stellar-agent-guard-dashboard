@@ -61,3 +61,9 @@ export function jitteredInterval(
   if (mode === "none") return intervalMs;
   return Math.floor(intervalMs * (0.8 + rng() * 0.2));
 }
+
+/** Keep polling until the owning view unmounts, even when one read fails. */
+export function startRefreshTimer(refresh: () => void, intervalMs: number): () => void {
+  const timer = setInterval(refresh, intervalMs);
+  return () => clearInterval(timer);
+}

@@ -47,14 +47,162 @@ test("compilePrintReport extracts correct fields from snapshot", () => {
     },
   } as any;
 
-  const report = compilePrintReport(mockSnapshot, "Testnet", "GADMIN...");
+  const report = compilePrintReport(mockSnapshot, "Testnet", "GADMIN...", {
+    networkPassphrase: "Test SDF Network ; September 2015",
+    capturedAt: "2026-09-25T12:00:00.000Z",
+  });
 
   assert.equal(report.contractId, "CABC123...");
   assert.equal(report.bytecodeHash, "hash123");
   assert.equal(report.adminKey, "GADMIN...");
   assert.equal(report.network, "Testnet");
+  assert.equal(report.networkPassphrase, "Test SDF Network ; September 2015");
+  assert.equal(report.capturedAt, "2026-09-25T12:00:00.000Z");
   assert.equal(report.dmsStatus, "OK");
-  assert.equal(report.allowlists.assets[0], "A1");
+  assert.equal(report.allowlists.state, "read");
+  assert.equal(report.allowlists.assets?.[0], "A1");
+  assert.deepEqual(
+    report.reads.map((read) => [read.key, read.state, read.readAt]),
+    [
+      ["status", "read", "2026-09-25"],
+      ["policy", "read", "2026-09-25"],
+      ["window", "empty", "2026-09-25"],
+      ["identity", "read", "2026-09-25"],
+    ],
+  );
+});
+
+/** A snapshot whose four sections can each succeed or fail independently. */
+function reportSnapshot(overrides: Record<string, unknown> = {}) {
+  return {
+    guard: "CABC123...",
+    fetchedAt: "2026-10-21T10:00:00.000Z",
+    status: {
+      ok: true,
+      value: {
+        heartbeat_expired: false,
+        admin_frozen: false,
+        has_policy: true,
+        last_heartbeat: 0n,
+        now: 1n,
+      },
+      readAt: "2026-10-21T10:00:01.000Z",
+    },
+    policy: {
+      ok: true,
+      value: {
+        per_tx_cap: 100n,
+        window_cap: 1000n,
+        window_secs: 60n,
+        assets: ["A1"],
+        recipients: ["R1"],
+        protocols: [],
+        paused: false,
+        active_from: 0n,
+        active_until: 0n,
+        allow_any_recipient: false,
+        dms_grace_secs: 0n,
+      },
+      readAt: "2026-10-21T10:00:02.000Z",
+    },
+    window: { ok: true, value: { total: 0n, entries: [] }, readAt: "2026-10-21T10:00:03.000Z" },
+    identity: {
+      ok: true,
+      value: { reportedWasmHash: "hash123", fetchedSha256: "hash123", bytes: 1000 },
+      readAt: "2026-10-21T10:00:04.000Z",
+    },
+    ...overrides,
+  } as any;
+}
+
+test("a complete report carries network, guard, capture time and per-section read times", () => {
+  const report = compilePrintReport(reportSnapshot(), "testnet", "GADMIN...", {
+    networkPassphrase: "Test SDF Network ; September 2015",
+    capturedAt: "2026-10-21T10:05:00.000Z",
+  });
+
+  assert.equal(report.contractId, "CABC123...");
+  assert.equal(report.network, "testnet");
+  assert.equal(report.networkPassphrase, "Test SDF Network ; September 2015");
+  assert.equal(report.capturedAt, "2026-10-21T10:05:00.000Z");
+  assert.deepEqual(
+    report.reads.map((read) => [read.key, read.state, read.readAt]),
+    [
+      ["status", "read", "2026-10-21T10:00:01.000Z"],
+      ["policy", "read", "2026-10-21T10:00:02.000Z"],
+      ["window", "read", "2026-10-21T10:00:03.000Z"],
+      ["identity", "read", "2026-10-21T10:00:04.000Z"],
+    ],
+  );
+  assert.ok(report.reads.every((read) => read.detail === null));
+  assert.deepEqual(report.allowlists.assets, ["A1"]);
+  assert.deepEqual(report.allowlists.recipients, ["R1"]);
+});
+
+test("a failed policy read is printed as unavailable, not as an empty policy", () => {
+  const report = compilePrintReport(
+    reportSnapshot({
+      policy: { ok: false, error: "RPC timed out while reading policy()" },
+    }),
+    "testnet",
+    "GADMIN...",
+    { capturedAt: "2026-10-21T10:05:00.000Z" },
+  );
+
+  assert.equal(report.policyRules, "Unavailable — the policy read failed");
+  assert.equal(report.allowlists.state, "failed");
+  assert.equal(report.allowlists.assets, null);
+  assert.equal(report.allowlists.recipients, null);
+  assert.equal(report.allowlists.protocols, null);
+  assert.ok(
+    !JSON.stringify(report).includes("No policy installed"),
+    "a failed read must never be rendered as default-deny",
+  );
+
+  const policyRead = report.reads.find((read) => read.key === "policy");
+  assert.equal(policyRead?.state, "failed");
+  assert.equal(policyRead?.readAt, null);
+  assert.match(policyRead?.detail ?? "", /RPC timed out/);
+});
+
+test("a failed status read is unavailable, never UNKNOWN-as-a-value or a default", () => {
+  const report = compilePrintReport(
+    reportSnapshot({ status: { ok: false, error: "status() simulation failed" } }),
+    "testnet",
+    "GADMIN...",
+  );
+  assert.equal(report.dmsStatus, "Unavailable — the status read failed");
+  const status = report.reads.find((read) => read.key === "status");
+  assert.equal(status?.state, "failed");
+  assert.match(status?.detail ?? "", /simulation failed/);
+});
+
+test("a failed identity read prints unavailable rather than a dash", () => {
+  const report = compilePrintReport(
+    reportSnapshot({ identity: { ok: false, error: "ledger entry unavailable" } }),
+    "testnet",
+    "GADMIN...",
+  );
+  assert.match(report.bytecodeHash, /Unavailable/);
+  assert.match(report.bytecodeHash, /identity read failed/);
+  assert.equal(report.reads.find((read) => read.key === "identity")?.state, "failed");
+});
+
+test("a successful read with no policy is explicit default-deny, not a failure", () => {
+  const report = compilePrintReport(
+    reportSnapshot({
+      policy: { ok: true, value: null, readAt: "2026-10-21T10:00:02.000Z" },
+    }),
+    "testnet",
+    "GADMIN...",
+  );
+  assert.equal(report.policyRules, "No policy installed (default-deny)");
+  assert.equal(report.allowlists.state, "read");
+  assert.deepEqual(report.allowlists.assets, []);
+  const policyRead = report.reads.find((read) => read.key === "policy");
+  assert.equal(policyRead?.state, "empty");
+  assert.equal(policyRead?.readAt, "2026-10-21T10:00:02.000Z");
+  assert.match(policyRead?.detail ?? "", /read succeeded/i);
 });
 
 // ── Deployment verification receipt (#396, #397) ───────────────────────────

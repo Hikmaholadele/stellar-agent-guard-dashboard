@@ -56,6 +56,15 @@ function fakeStorage(): StorageLike {
   };
 }
 
+/**
+ * A timestamp inside the retention window. A fixed calendar date here is a
+ * time bomb: once it is older than TX_HISTORY_MAX_AGE_DAYS, loadTxHistory
+ * prunes the fixture and every test that reads it back fails.
+ */
+function recentIso(minutesAgo = 60): string {
+  return new Date(Date.now() - minutesAgo * 60 * 1000).toISOString();
+}
+
 function entry(overrides: Partial<TxHistoryEntry> = {}): TxHistoryEntry {
   return {
     hash: `hash-${Math.random().toString(16).slice(2)}`,
@@ -64,7 +73,7 @@ function entry(overrides: Partial<TxHistoryEntry> = {}): TxHistoryEntry {
     feeStroops: "210",
     networkName: NETWORK.name,
     networkPassphrase: NETWORK.passphrase,
-    recordedAt: "2026-09-24T10:00:00.000Z",
+    recordedAt: recentIso(),
     ...overrides,
   };
 }
@@ -168,7 +177,7 @@ test("legacy history rows load with unknown network provenance", () => {
         operation: "freeze",
         status: "confirmed",
         feeStroops: null,
-        recordedAt: "2026-09-24T10:00:00.000Z",
+        recordedAt: recentIso(),
       },
     ]),
   );
@@ -331,7 +340,12 @@ test("an empty list paginates to a single empty page", () => {
 
 test("CSV export has a fixed header and one quoted row per entry", () => {
   const entries = [
-    entry({ hash: "h1", operation: "set_policy", feeStroops: "310" }),
+    entry({
+      hash: "h1",
+      operation: "set_policy",
+      feeStroops: "310",
+      recordedAt: "2026-09-24T10:00:00.000Z",
+    }),
     entry({
       hash: "h2",
       operation: 'odd "operation"',
@@ -349,7 +363,7 @@ test("CSV export has a fixed header and one quoted row per entry", () => {
   assert.equal(lines.length, 3);
   assert.equal(
     lines[1],
-    `"2026-09-24T10:00:00.000Z","set_policy","confirmed","h1","310","${NETWORK.name}","${NETWORK.passphrase}"`,
+    `"${entries[0]!.recordedAt}","set_policy","confirmed","h1","310","${NETWORK.name}","${NETWORK.passphrase}"`,
   );
   // Embedded quotes are doubled per RFC 4180, and a null fee exports empty.
   assert.equal(

@@ -9,11 +9,12 @@ export type DerivedStatus = "Active" | "Frozen" | "Expired" | "Unknown";
 export interface FleetRow {
   contact: Contact;
   snapshot: GuardSnapshot | null;
-  error?: string;
+  error?: string | undefined;
   derivedStatus: DerivedStatus;
   spend24h: bigint;
   dmsCountdownSecs: bigint | null;
   network: string;
+  retry?: () => Promise<FleetRow>;
 }
 
 export async function pollFleet(
@@ -59,6 +60,10 @@ export async function pollFleet(
         spend24h,
         dmsCountdownSecs,
         network: NETWORK.name,
+        retry: async (): Promise<FleetRow> => {
+          const results = await pollFleet(server, [contact], _readSnapshot);
+          return results[0]!;
+        },
       };
     } catch (error) {
       return {
@@ -69,6 +74,10 @@ export async function pollFleet(
         spend24h: 0n,
         dmsCountdownSecs: null,
         network: NETWORK.name,
+        retry: async (): Promise<FleetRow> => {
+          const results = await pollFleet(server, [contact], _readSnapshot);
+          return results[0]!;
+        },
       };
     }
   });

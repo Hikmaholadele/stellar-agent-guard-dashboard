@@ -57,8 +57,12 @@ async function ensureWalletConnected(page: Page): Promise<void> {
   }
   await expect(connected).toBeVisible();
   // The full address rides on the truncated text's `title`, as it does for an
-  // operator hovering the account that is about to sign.
-  await expect(page.getByTitle(MOCK_ADMIN_ADDRESS)).toBeVisible();
+  // operator hovering the account that is about to sign. Scoped to the wallet
+  // row: the deploy panel also titles the deployer address, so a page-wide
+  // title lookup matches both and violates strict mode.
+  await expect(
+    page.locator("div.row").filter({ has: connected }).getByTitle(MOCK_ADMIN_ADDRESS),
+  ).toBeVisible();
 }
 
 /**

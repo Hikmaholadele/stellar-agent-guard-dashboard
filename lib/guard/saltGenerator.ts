@@ -100,6 +100,82 @@ export function formatSalt(bytes: Uint8Array): string {
   return toHex(bytes);
 }
 
+/**
+ * Every input that determines the predicted address.
+ *
+ * The address is `sha256(network id ‖ deployer ‖ salt)`, so these four values
+ * are the whole derivation. Keeping them together lets the UI state what the
+ * prediction is bound to and detect an obsolete preview instead of showing an
+ * address for the salt the operator just replaced.
+ */
+export interface DeployPredictionInputs {
+  deployerPublicKey: string;
+  /** The exact 32-byte salt, lowercase hex. */
+  saltHex: string;
+  networkName: string;
+  networkPassphrase: string;
+}
+
+/** A stable key for "was this prediction computed from these inputs?". */
+export function deployPredictionKey(inputs: DeployPredictionInputs): string {
+  return [
+    inputs.deployerPublicKey,
+    inputs.saltHex,
+    inputs.networkName,
+    inputs.networkPassphrase,
+  ].join("\u0000");
+}
+
+/**
+ * Which inputs changed between two predictions. Empty means the prediction is
+ * still current; otherwise the caller marks it obsolete and recomputes.
+ */
+export function deployPredictionChanges(
+  previous: DeployPredictionInputs,
+  current: DeployPredictionInputs,
+): Array<"deployer" | "salt" | "network"> {
+  const changes: Array<"deployer" | "salt" | "network"> = [];
+  if (previous.deployerPublicKey !== current.deployerPublicKey) changes.push("deployer");
+  if (previous.saltHex !== current.saltHex) changes.push("salt");
+  if (
+    previous.networkName !== current.networkName ||
+    previous.networkPassphrase !== current.networkPassphrase
+  ) {
+    changes.push("network");
+  }
+  return changes;
+}
+
+/**
+ * The one-paragraph explanation shown beside the prediction.
+ *
+ * It states the derivation and its limits in the same breath: a prediction is
+ * deterministic, but it is not a reservation and says nothing about whether the
+ * address is unique or still free. Only the chain read can report a collision.
+ */
+export function describeDeployPrediction(inputs: DeployPredictionInputs): string {
+  return (
+    `Derived from sha256(network id + deployer ${inputs.deployerPublicKey} + salt ${inputs.saltHex}) ` +
+    `on ${inputs.networkName}. The same deployer, salt and network always produce the same address; ` +
+    "changing either the deployer or the salt changes it. This is a prediction, not a reservation: " +
+    "it does not claim the address is unique or unused — only a chain read can report a collision."
+  );
+}
+
+/** Why these inputs cannot produce a prediction, or null when they can. */
+export function deployPredictionProblem(inputs: DeployPredictionInputs): string | null {
+  if (!StrKey.isValidEd25519PublicKey(inputs.deployerPublicKey.trim())) {
+    return "The deployer is not a valid Stellar account address, so no address can be derived.";
+  }
+  if (!/^[0-9a-f]{64}$/i.test(inputs.saltHex.trim())) {
+    return `The salt must be exactly ${SALT_BYTES} bytes (${SALT_BYTES * 2} hex characters).`;
+  }
+  if (inputs.networkName.trim() === "" || inputs.networkPassphrase.trim() === "") {
+    return "The network name and passphrase are part of the derivation and must be set.";
+  }
+  return null;
+}
+
 export type AddressPreview = { ok: true; address: string } | { ok: false; message: string };
 
 /**

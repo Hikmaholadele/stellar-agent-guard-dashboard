@@ -45,6 +45,13 @@ export async function installFreighterMock(
   await page.addInitScript(
     ({ address, passphrase }: { address: string; passphrase: string }) => {
       const AUTHORIZED_KEY = "stellar-agent-guard.e2e.wallet-authorized";
+      const REJECT_NEXT_SIGN_KEY = "stellar-agent-guard.e2e.reject-next-sign";
+
+      const rejectNextSign = (): boolean => {
+        if (window.localStorage.getItem(REJECT_NEXT_SIGN_KEY) !== "1") return false;
+        window.localStorage.removeItem(REJECT_NEXT_SIGN_KEY);
+        return true;
+      };
 
       const isAuthorized = (): boolean => {
         try {
@@ -113,12 +120,20 @@ export async function installFreighterMock(
             });
             return;
           case "SUBMIT_TRANSACTION":
+            if (rejectNextSign()) {
+              reply({ apiError: { code: -4, message: "User rejected the request" } });
+              return;
+            }
             reply({
               signedTransaction: data.transactionXdr ?? "",
               signerAddress: data.accountToSign || address,
             });
             return;
           case "SUBMIT_AUTH_ENTRY":
+            if (rejectNextSign()) {
+              reply({ apiError: { code: -4, message: "User rejected the request" } });
+              return;
+            }
             reply({
               signedAuthEntry: data.entryXdr ?? "",
               signerAddress: data.accountToSign || address,

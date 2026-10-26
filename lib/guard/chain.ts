@@ -51,7 +51,17 @@ export function createServer(rpcUrl: string = NETWORK.rpcUrl): rpc.Server {
  * removed, ready to copy into a report.
  */
 export type ReadResult<T> =
-  { ok: true; value: T } | { ok: false; error: string; diagnostic?: string };
+  | {
+      ok: true;
+      value: T;
+      /**
+       * When this specific read completed. Optional because pure unit fixtures
+       * and older callers may not carry a clock; a report falls back to the
+       * snapshot's batch timestamp rather than inventing one.
+       */
+      readAt?: string;
+    }
+  | { ok: false; error: string; diagnostic?: string };
 
 /** The endpoint a server was constructed with, for diagnostics. */
 function endpointOf(server: rpc.Server): string {

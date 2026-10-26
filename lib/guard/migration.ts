@@ -440,6 +440,123 @@ export type MigrationPlan =
     }
   | { ok: false; report: CompatibilityReport; message: string };
 
+/** The network a migration preview was built for. */
+export interface MigrationNetwork {
+  name: string;
+  passphrase: string;
+}
+
+/** The destination identity a preview is bound to. */
+export interface MigrationScope {
+  destination: string;
+  network: MigrationNetwork;
+}
+
+/**
+ * A source read together with the destination it was reviewed for.
+ *
+ * The source policy and the destination account are two different chain facts.
+ * Reading the source once and then switching the active guard would otherwise
+ * leave a plan that looks reviewed but was never reviewed *for that guard*.
+ * Binding the read to this scope is what makes that stale plan detectable
+ * instead of merely old.
+ */
+export interface MigrationPreview {
+  destination: string;
+  network: MigrationNetwork;
+  /** When the source and destination reads that produced this plan completed. */
+  readAt: string;
+  plan: MigrationPlan;
+}
+
+/** Build the record the review step displays and the submit guard checks. */
+export function buildMigrationPreview(params: {
+  plan: MigrationPlan;
+  destination: string;
+  network: MigrationNetwork;
+  readAt?: string;
+}): MigrationPreview {
+  return {
+    plan: params.plan,
+    destination: params.destination.trim(),
+    network: { ...params.network },
+    readAt: params.readAt ?? new Date().toISOString(),
+  };
+}
+
+export type PreviewValidity = { ok: true } | { ok: false; reason: string };
+
+/**
+ * Is this preview still about the destination the operator is looking at?
+ *
+ * Deliberately strict: a different network *name* or passphrase is just as much
+ * a different target as a different address. A preview that survived either
+ * change would carry a policy read from one account into another.
+ */
+export function migrationPreviewValidity(
+  preview: MigrationPreview,
+  current: MigrationScope,
+): PreviewValidity {
+  const destination = current.destination.trim();
+  if (preview.destination === "") {
+    return {
+      ok: false,
+      reason: "The preview has no destination address.",
+    };
+  }
+  if (destination === "") {
+    return {
+      ok: false,
+      reason: `The destination is now empty; the preview was built for ${preview.destination}. Re-read the source and destination before applying.`,
+    };
+  }
+  if (destination !== preview.destination) {
+    return {
+      ok: false,
+      reason: `The destination changed from ${preview.destination} to ${destination}. Re-read the source and destination before applying.`,
+    };
+  }
+  if (current.network.name !== preview.network.name) {
+    return {
+      ok: false,
+      reason: `The network changed from ${preview.network.name} to ${current.network.name}. Re-read the source and destination before applying.`,
+    };
+  }
+  if (current.network.passphrase !== preview.network.passphrase) {
+    return {
+      ok: false,
+      reason:
+        "The network passphrase changed. A policy read for one network cannot authorize a write on another; re-read before applying.",
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * The single submit gate: a portable plan, read for this exact destination and
+ * network. The UI calls this both to enable the button and again immediately
+ * before invoking the wallet, so a switch in another tab cannot slip through.
+ */
+export function canSubmitMigrationPreview(
+  preview: MigrationPreview,
+  current: MigrationScope,
+): PreviewValidity {
+  const scope = migrationPreviewValidity(preview, current);
+  if (!scope.ok) return scope;
+  if (!preview.plan.ok) {
+    return {
+      ok: false,
+      reason: "The preview is not a directly portable policy.",
+    };
+  }
+  return { ok: true };
+}
+
+/** A readable statement of what the preview is bound to, for the review step. */
+export function describeMigrationScope(preview: MigrationPreview): string {
+  return `${preview.destination} on ${preview.network.name}`;
+}
+
 /**
  * Read a source policy and prepare the target's `set_policy` payload.
  *
